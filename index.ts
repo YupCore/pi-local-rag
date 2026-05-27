@@ -37,6 +37,7 @@
  *   index.ts         — extension entry point (this file) + re-exports
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
 import { resolve, extname, basename, relative } from "node:path";
@@ -134,8 +135,29 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── /rag command ──
+  const RAG_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "index",    label: "index",    description: "Index a file or directory" },
+    { value: "search",   label: "search",   description: "Search the index" },
+    { value: "find",     label: "find",     description: "List indexed files matching a glob" },
+    { value: "status",   label: "status",   description: "Show index statistics" },
+    { value: "rebuild",  label: "rebuild",  description: "Force re-embed all tracked files" },
+    { value: "refresh",  label: "refresh",  description: "Incremental refresh — new/changed files only" },
+    { value: "clear",    label: "clear",    description: "Clear the index" },
+    { value: "exclude",  label: "exclude",  description: "Manage gitignore-style exclude patterns" },
+    { value: "ext",      label: "ext",      description: "Manage indexable file-extension allowlist" },
+    { value: "on",       label: "on",       description: "Enable auto-injection" },
+    { value: "off",      label: "off",      description: "Disable auto-injection" },
+    { value: "help",     label: "help",     description: "Show all /rag commands" },
+  ];
+
   pi.registerCommand("rag", {
     description: "pi-local-rag: /rag index|search|find|status|rebuild|refresh|clear|exclude|on|off|ext",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const filtered = RAG_SUBCOMMANDS
+        .filter((s) => s.value.startsWith(prefix))
+        .map((s) => ({ value: s.value, label: s.label, description: s.description }));
+      return filtered.length > 0 ? filtered : null;
+    },
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
