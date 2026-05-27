@@ -1,4 +1,5 @@
 node_modules/
+.pi/
 *.js
 *.d.ts
 !types/*.d.ts
