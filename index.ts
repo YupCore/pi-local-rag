@@ -61,7 +61,7 @@ export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
 export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
 export {
   sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
-  isExcludedByConfig, extractText,
+  isExcludedByConfig, extractText, getOcrTooling, isSparsePdfText,
 } from "./chunking.ts";
 export { embed, embedBatch } from "./embed.ts";
 export type { ScoredChunk } from "./search.ts";

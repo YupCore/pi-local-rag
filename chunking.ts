@@ -1,11 +1,15 @@
-import { existsSync, readFileSync, readdirSync, statSync, promises as fsPromises } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, mkdtempSync, rmSync, writeFileSync, promises as fsPromises } from "node:fs";
 import { extname, basename, join, relative } from "node:path";
+import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import ignore from "ignore";
 import { BINARY_DOC_EXTS, TEXT_MAX_BYTES, BINARY_DOC_MAX_BYTES, SKIP_DIRS } from "./constants.ts";
 import { loadConfig, resolveExtensions, type RagConfig } from "./config.ts";
 
 const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+
+function stderrProgress(msg: string) { process.stderr.write(`\r\x1b[2K${msg}`); }
 
 export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
@@ -206,6 +210,64 @@ async function withPdfjsSilenced<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ─── OCR fallback for image-based PDFs ───────────────────────────────────────
+
+type OcrTooling = { available: false } | { available: true; langs: string };
+let _ocrTooling: OcrTooling | undefined;
+let _ocrUnavailableLogged = false;
+
+/** One-shot probe for system pdftoppm + tesseract. Caches the result. */
+export function getOcrTooling(): OcrTooling {
+  if (_ocrTooling) return _ocrTooling;
+  const pdftoppm = spawnSync("pdftoppm", ["-v"]);
+  const tess = spawnSync("tesseract", ["--list-langs"], { encoding: "utf-8" });
+  if (pdftoppm.error || tess.error) return (_ocrTooling = { available: false });
+  // tesseract prints langs on stderr in some builds, stdout in others.
+  const out = `${tess.stdout || ""}\n${tess.stderr || ""}`;
+  const have = new Set(out.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
+  const wanted = ["jpn", "eng"].filter(l => have.has(l));
+  if (!wanted.length) return (_ocrTooling = { available: false });
+  return (_ocrTooling = { available: true, langs: wanted.join("+") });
+}
+
+/** Render `buf` to PNGs via pdftoppm, OCR each page via tesseract, return concatenated text. */
+async function ocrPdf(buf: Buffer, langs: string, label: string): Promise<string> {
+  const MAX_PAGES = 200;
+  const PER_PAGE_TIMEOUT_MS = 60_000;
+  const dir = mkdtempSync(join(tmpdir(), "rag-ocr-"));
+  try {
+    const pdfPath = join(dir, "in.pdf");
+    writeFileSync(pdfPath, buf);
+    const render = spawnSync("pdftoppm", ["-png", "-r", "200", pdfPath, join(dir, "p")], { encoding: "utf-8" });
+    if (render.status !== 0) return "";
+    const pages = readdirSync(dir).filter(f => f.startsWith("p-") && f.endsWith(".png")).sort();
+    const total = Math.min(pages.length, MAX_PAGES);
+    if (pages.length > MAX_PAGES) {
+      process.stderr.write(`\r\x1b[2K[rag] OCR ${label}: ${pages.length} pages, capping at ${MAX_PAGES}\n`);
+    }
+    const out: string[] = [];
+    for (let i = 0; i < total; i++) {
+      stderrProgress(`[OCR ${i + 1}/${total}] ${label}`);
+      await yield_();
+      const r = spawnSync("tesseract", [join(dir, pages[i]), "-", "-l", langs], {
+        encoding: "utf-8",
+        timeout: PER_PAGE_TIMEOUT_MS,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      out.push(r.status === 0 ? (r.stdout ?? "") : "");
+    }
+    process.stderr.write(`\r\x1b[2K`);
+    return out.join("\n\n");
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/** True if `text` looks too sparse for `numpages` to be the real content of the document. */
+export function isSparsePdfText(text: string, numpages: number): boolean {
+  return text.trim().length < 50 * Math.max(1, numpages);
+}
+
 /**
  * Read and decode a file into UTF-8 text. PDF and DOCX are routed through
  * extraction libraries; everything else is read as plain UTF-8. Hash is
@@ -218,7 +280,20 @@ export async function extractText(fp: string): Promise<{ text: string; hash: str
     const buf = readFileSync(fp);
     const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
     const data = await withPdfjsSilenced(() => pdf(buf));
-    return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
+    let text = data.text;
+    if (isSparsePdfText(text, data.numpages ?? 1)) {
+      const tools = getOcrTooling();
+      if (tools.available) {
+        const ocr = await ocrPdf(buf, tools.langs, basename(fp));
+        if (ocr.trim().length > text.trim().length) text = ocr;
+      } else if (!_ocrUnavailableLogged) {
+        _ocrUnavailableLogged = true;
+        process.stderr.write(
+          `\r\x1b[2K[rag] OCR unavailable: install pdftoppm + tesseract (with jpn/eng traineddata) to index image PDFs\n`
+        );
+      }
+    }
+    return { text, hash: sha256(buf.toString("binary")), size: buf.length };
   }
   if (ext === ".docx") {
     const buf = readFileSync(fp);
