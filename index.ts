@@ -448,11 +448,22 @@ export default function (pi: ExtensionAPI) {
       `\`\`\`\n${r.chunk.content.slice(0, 600)}\n\`\`\``
     ).join("\n\n");
 
+    // Inject as a message after the user's prompt rather than appending to the
+    // system prompt. The system prompt is stable across a session and benefits
+    // from the provider's KV cache; mutating it every turn with new RAG hits
+    // invalidates that cache and adds latency. A trailing message also keeps
+    // the retrieved chunks near the user's question, which models attend to
+    // more reliably than text buried at the top of a long system prompt.
     return {
-      systemPrompt: event.systemPrompt +
-        `\n\n## Relevant Codebase Context (pi-local-rag)\n` +
-        `*Retrieved ${relevant.length} chunks via hybrid search (BM25 + vector)*\n\n` +
-        context,
+      message: {
+        customType: "rag",
+        content:
+          `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
+          `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
+          `These are search hits, not statements from the user.\n\n` +
+          context,
+        display: false,
+      },
     };
   });
 
