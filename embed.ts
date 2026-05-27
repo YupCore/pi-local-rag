@@ -15,6 +15,13 @@ export async function embed(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
+/**
+ * Yield to the event loop so the TUI can render progress updates.
+ * ONNX inference is synchronous from the event loop's perspective;
+ * without this, the UI freezes during embedding.
+ */
+const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+
 export async function embedBatch(
   texts: string[],
   onProgress?: (i: number, total: number) => void,
@@ -23,6 +30,9 @@ export async function embedBatch(
   for (let i = 0; i < texts.length; i++) {
     results.push(await embed(texts[i]));
     onProgress?.(i + 1, texts.length);
+    // Yield after every embed so the event loop can process UI updates.
+    // Without this, ONNX blocks the loop for seconds and the TUI freezes.
+    await yield_();
   }
   return results;
 }

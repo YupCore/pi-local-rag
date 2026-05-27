@@ -47,7 +47,7 @@ import { RST, B, D, GREEN, CYAN } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { openDb, loadIndex, saveIndex, getIndexStats } from "./db.ts";
-import { collectFiles, collectFromTracked, isExcludedByConfig } from "./chunking.ts";
+import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
 
@@ -60,12 +60,14 @@ export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions 
 export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
 export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
 export {
-  sha256, chunkText, collectFiles, collectFromTracked, isExcludedByConfig, extractText,
+  sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
+  isExcludedByConfig, extractText,
 } from "./chunking.ts";
 export { embed, embedBatch } from "./embed.ts";
 export type { ScoredChunk } from "./search.ts";
 export { cosineSimilarity, normalize, hybridSearch } from "./search.ts";
-export { isIndexStale } from "./indexing.ts";
+export { isIndexStale, indexFiles } from "./indexing.ts";
+export type { ProgressCallbacks } from "./indexing.ts";
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
@@ -140,7 +142,7 @@ export default function (pi: ExtensionAPI) {
     { value: "search",   label: "search",   description: "Search the index" },
     { value: "find",     label: "find",     description: "List indexed files matching a glob" },
     { value: "status",   label: "status",   description: "Show index statistics" },
-    { value: "rebuild",  label: "rebuild",  description: "Force re-embed all tracked files" },
+    { value: "rebuild",  label: "rebuild",  description: "Re-embed tracked files (--force to skip hash check + wipe DB)" },
     { value: "refresh",  label: "refresh",  description: "Incremental refresh — new/changed files only" },
     { value: "clear",    label: "clear",    description: "Clear the index" },
     { value: "exclude",  label: "exclude",  description: "Manage gitignore-style exclude patterns" },
@@ -151,7 +153,7 @@ export default function (pi: ExtensionAPI) {
   ];
 
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|find|status|rebuild|refresh|clear|exclude|on|off|ext",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild [--force]|refresh|clear|exclude|on|off|ext",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const filtered = RAG_SUBCOMMANDS
         .filter((s) => s.value.startsWith(prefix))
@@ -255,75 +257,105 @@ export default function (pi: ExtensionAPI) {
 
       // ── rebuild ──
       if (cmd === "rebuild") {
-        const index = loadIndex();
+        // Parse --force flag from any position after "rebuild".
+        const rebuildArgs = parts.slice(1);
+        const force = rebuildArgs.includes("--force");
+
+        const database = openDb();
         const config = loadConfig();
-        const indexedFiles = Object.keys(index.files);
-        const trackedFiles = collectFromTracked(config);
+        try {
+          const indexedRows = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
+          const indexedFileSet = new Set(indexedRows.map(f => f.path));
 
-        // Union of currently-indexed files and files discovered by walking tracked paths.
-        const targetSet = new Set<string>([...trackedFiles]);
-        for (const f of indexedFiles) {
-          if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
-            targetSet.add(f);
+          // Walking tracked paths can stall the event loop on large trees
+          // (45k+ files). Use the async variant + yield up-front so the user
+          // gets immediate feedback before the heavy work begins.
+          ctx.ui.notify("Scanning tracked paths...", "info");
+          const trackedFiles = await collectFromTrackedAsync(config);
+
+          // Union of currently-indexed files and files discovered by walking tracked paths.
+          const targetSet = new Set<string>([...trackedFiles]);
+          for (const f of indexedFileSet) {
+            if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+              targetSet.add(f);
+            }
           }
+          const targetFiles = [...targetSet];
+
+          if (!targetFiles.length && !indexedFileSet.size) {
+            ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
+            return;
+          }
+
+          // Files in the index but no longer present (deleted, excluded, or untracked).
+          const droppedFiles = [...indexedFileSet].filter(f => !targetSet.has(f));
+          for (const f of droppedFiles) {
+            database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)").run(f);
+            database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
+            database.prepare("DELETE FROM files WHERE path = ?").run(f);
+          }
+          if (force) {
+            // --force: wipe everything and rebuild the FTS index. indexFiles
+            // will then insert fresh rows for every targetFile, bypassing the
+            // skip-on-equal-hash check.
+            database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
+            database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
+          } else {
+            for (const f of targetFiles) {
+              database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
+            }
+          }
+
+          const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
+          ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
+          if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+          if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+
+          // Yield so the TUI can paint the "Rebuilding" message before
+          // indexFiles starts hammering the event loop.
+          await new Promise<void>(r => setTimeout(r, 0));
+
+          function progressBar(n: number, total: number, width = 24): string {
+            const filled = Math.round((n / total) * width);
+            return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
+          }
+
+          const result = await indexFiles(targetFiles, {
+            onFile(current, total, filename, skipped) {
+              const pct = Math.round((current / total) * 100);
+              const bar = progressBar(current, total);
+              ctx.ui.setStatus("rag", `■ Rebuilding ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
+              ctx.ui.setWidget("rag", [
+                `${B}${CYAN}Rebuilding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+                `${D}file:    ${RST}${filename}`,
+                `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
+              ]);
+            },
+            onEmbed(done, total) {
+              const pct = Math.round((done / total) * 100);
+              const bar = progressBar(done, total);
+              ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+              ctx.ui.setWidget("rag", [
+                `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+                `${D}chunks:  ${RST}${done}/${total}`,
+              ]);
+            },
+            onChunk(ci, total, filename) {
+              ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+            },
+            onSave() {
+              ctx.ui.setStatus("rag", `■ Saving index...`);
+            },
+          }, database, force);
+
+          ctx.ui.setStatus("rag", undefined);
+          ctx.ui.setWidget("rag", undefined);
+
+          const secs = (result.durationMs / 1000).toFixed(1);
+          ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
+        } finally {
+          database.close();
         }
-        const targetFiles = [...targetSet];
-
-        if (!targetFiles.length && !indexedFiles.length) {
-          ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
-          return;
-        }
-
-        // Files in the index but no longer present (deleted, excluded, or untracked).
-        const droppedFiles = indexedFiles.filter(f => !targetSet.has(f));
-        for (const f of droppedFiles) {
-          index.chunks = index.chunks.filter(c => c.file !== f);
-          delete index.files[f];
-        }
-
-        // Force re-embed all target files (treat new ones as not yet embedded).
-        for (const f of targetFiles) {
-          if (index.files[f]) index.files[f].embedded = false;
-        }
-        saveIndex(index);
-
-        const newFiles = targetFiles.filter(f => !indexedFiles.includes(f));
-        if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
-        if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
-        ctx.ui.notify(`Rebuilding ${targetFiles.length} files...`, "info");
-
-        const existingFiles = targetFiles;
-        const deletedFiles = droppedFiles;
-
-        function progressBar(n: number, total: number, width = 24): string {
-          const filled = Math.round((n / total) * width);
-          return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
-        }
-
-        const result = await indexFiles(existingFiles, {
-          onFile(current, total, filename, skipped) {
-            const pct = Math.round((current / total) * 100);
-            const bar = progressBar(current, total);
-            ctx.ui.setStatus("rag", `■ Rebuilding ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
-            ctx.ui.setWidget("rag", [
-              `${B}${CYAN}Rebuilding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-              `${D}file:    ${RST}${filename}`,
-              `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
-            ]);
-          },
-          onChunk(ci, total, filename) {
-            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
-          },
-          onSave() {
-            ctx.ui.setStatus("rag", `■ Saving index...`);
-          },
-        });
-
-        ctx.ui.setStatus("rag", undefined);
-        ctx.ui.setWidget("rag", undefined);
-
-        const secs = (result.durationMs / 1000).toFixed(1);
-        ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${deletedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
         return;
       }
 
@@ -519,7 +551,7 @@ export default function (pi: ExtensionAPI) {
           ["/rag search <query>",     "Hybrid BM25 + vector search over the index"],
           ["/rag find <glob>",        "List indexed files matching a glob (e.g. *.ts, src/*)"],
           ["/rag status",             "Show index stats and active configuration"],
-          ["/rag rebuild",            "Re-embed all tracked files (forced; picks up new files)"],
+          ["/rag rebuild [--force]",  "Re-embed tracked files; --force wipes DB and bypasses hash skip"],
           ["/rag refresh",            "Incremental refresh — only new/changed files (also fires automatically every 24h)"],
           ["/rag clear",              "Delete all indexed chunks"],
           ["/rag exclude <pattern>",  "Add a gitignore-style exclude pattern (omit to list; -<pattern> to remove)"],

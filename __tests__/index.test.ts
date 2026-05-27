@@ -443,6 +443,95 @@ describe("isExcludedByConfig", () => {
   });
 });
 
+// ─── collectFilesAsync / collectFromTrackedAsync ────────────────────────────
+
+describe("collectFilesAsync", () => {
+  it("walks a tree like the sync version (extension allowlist, skip dirs, size caps)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rag-async-walk-"));
+    try {
+      writeFileSync(join(root, "a.ts"), "x");
+      writeFileSync(join(root, "b.md"), "x");
+      writeFileSync(join(root, "huge.ts"), "x".repeat(500_001));
+      mkdirSync(join(root, "node_modules"));
+      writeFileSync(join(root, "node_modules", "skip.ts"), "x");
+      mkdirSync(join(root, "src"));
+      writeFileSync(join(root, "src", "deep.py"), "x");
+
+      const { collectFilesAsync } = await import("../index.ts");
+      const files = (await collectFilesAsync(root)).map(f => f.replace(root, "")).sort();
+      expect(files).toContain("/a.ts");
+      expect(files).toContain("/b.md");
+      expect(files).toContain("/src/deep.py");
+      expect(files.some(f => f.includes("node_modules"))).toBe(false);
+      expect(files.some(f => f.endsWith("huge.ts"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("excludePatterns work the same as in the sync collectFiles", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rag-async-excl-"));
+    try {
+      writeFileSync(join(root, "page.html"), "<p>x</p>");
+      writeFileSync(join(root, "a.ts"), "x");
+      const { collectFilesAsync } = await import("../index.ts");
+      const files = (await collectFilesAsync(root, undefined, ["*.html"])).map(f => f.replace(root, ""));
+      expect(files.some(f => f.endsWith(".html"))).toBe(false);
+      expect(files.some(f => f.endsWith(".ts"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── indexFiles force flag ──────────────────────────────────────────────────
+
+describe("indexFiles --force", () => {
+  let tmp: string;
+  let savedRagDir: string | undefined;
+  let mod: typeof import("../index.ts");
+
+  beforeAll(async () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "rag-force-")));
+    savedRagDir = process.env.PI_RAG_DIR;
+    process.env.PI_RAG_DIR = tmp;
+    vi.resetModules();
+    mod = await import("../index.ts");
+  });
+
+  afterAll(() => {
+    rmSync(tmp, { recursive: true, force: true });
+    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
+    else delete process.env.PI_RAG_DIR;
+  });
+
+  it("second pass: skips unchanged files by default; re-embeds them when force=true", async () => {
+    const proj = mkdtempSync(join(tmpdir(), "rag-force-proj-"));
+    try {
+      const fp = join(proj, "stable.ts");
+      writeFileSync(fp, "export const stable = 1;\n");
+
+      // First pass: file is fresh, gets indexed.
+      const r1 = await mod.indexFiles([fp]);
+      expect(r1.indexed).toBe(1);
+      expect(r1.skipped).toBe(0);
+
+      // Second pass without force: hash matches → file should be skipped.
+      const r2 = await mod.indexFiles([fp]);
+      expect(r2.skipped).toBe(1);
+      expect(r2.indexed).toBe(0);
+
+      // Third pass with force=true: re-embeds the file even though the hash
+      // hasn't changed (commit 8432a15 / theli-ua).
+      const r3 = await mod.indexFiles([fp], undefined, undefined, true);
+      expect(r3.indexed).toBe(1);
+      expect(r3.skipped).toBe(0);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── extractText (plain / PDF / DOCX / HTML) ────────────────────────────────
 
 describe("extractText", () => {
