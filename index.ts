@@ -6,6 +6,7 @@
  *
  * /rag index <path>     → index + embed a file or directory
  * /rag search <query>   → hybrid search (BM25 + vector)
+ * /rag find <glob>      → list indexed files matching a glob
  * /rag status           → show index stats
  * /rag rebuild          → rebuild entire index
  * /rag clear            → clear index
@@ -21,7 +22,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
-import { join, extname, basename } from "node:path";
+import { join, extname, basename, relative } from "node:path";
+import ignore from "ignore";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 
@@ -527,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /rag command ──
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|status|rebuild|clear|on|off|ext",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|on|off|ext",
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
@@ -727,12 +729,47 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // ── find ──
+      if (cmd === "find") {
+        const glob = parts.slice(1).join(" ").trim();
+        if (!glob) {
+          ctx.ui.notify("Usage: /rag find <glob>   e.g. *.html, page*, foo.js, src/*.ts", "warning");
+          return;
+        }
+
+        const index = loadIndex();
+        const cwd = process.cwd();
+        const ig = ignore().add([glob]);
+
+        const matches: string[] = [];
+        for (const fp of Object.keys(index.files)) {
+          const rel = relative(cwd, fp);
+          const candidate = rel && !rel.startsWith("..") ? rel : basename(fp);
+          if (ig.ignores(candidate)) matches.push(fp);
+        }
+        matches.sort();
+
+        if (!matches.length) {
+          ctx.ui.notify(`No indexed files match: ${glob}`, "warning");
+          return;
+        }
+        const th = ctx.ui.theme;
+        const lines: string[] = [
+          th.bold(`🔍 ${matches.length} indexed file${matches.length === 1 ? "" : "s"} matching "${glob}"`),
+          "",
+        ];
+        for (const fp of matches) lines.push(th.fg("success", fp));
+        ctx.ui.setWidget("rag-find", lines);
+        return;
+      }
+
       // ── help ──
       if (cmd === "help") {
         const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
         const cmds: [string, string][] = [
           ["/rag index <path>",       "Index a file or directory (chunks, embeds, stores)"],
           ["/rag search <query>",     "Hybrid BM25 + vector search over the index"],
+          ["/rag find <glob>",        "List indexed files matching a glob (e.g. *.ts, src/*)"],
           ["/rag status",             "Show index stats and active configuration"],
           ["/rag rebuild",            "Re-embed all previously indexed files"],
           ["/rag clear",              "Delete all indexed chunks"],
