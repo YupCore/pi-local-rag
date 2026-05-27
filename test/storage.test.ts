@@ -31,6 +31,8 @@ test("loadConfig: returns defaults when no config file exists", () => {
   assert.equal(cfg.ragAlpha, 0.4);
   assert.deepEqual(cfg.extraExtensions, []);
   assert.deepEqual(cfg.excludeExtensions, []);
+  assert.deepEqual(cfg.trackedPaths, []);
+  assert.deepEqual(cfg.excludePatterns, []);
 });
 
 test("saveConfig / loadConfig round-trip persists every field", () => {
@@ -41,6 +43,8 @@ test("saveConfig / loadConfig round-trip persists every field", () => {
     ragAlpha: 0.7,
     extraExtensions: [".cs", ".tex"],
     excludeExtensions: [".md"],
+    trackedPaths: ["/tmp/proj-a", "/tmp/proj-b"],
+    excludePatterns: ["*.log", "node_modules/"],
   };
   saveConfig(written);
   const read = loadConfig();

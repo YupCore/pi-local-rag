@@ -8,8 +8,9 @@
  * /rag search <query>   → hybrid search (BM25 + vector)
  * /rag find <glob>      → list indexed files matching a glob
  * /rag status           → show index stats
- * /rag rebuild          → rebuild entire index
+ * /rag rebuild          → re-embed tracked paths (picks up new files)
  * /rag clear            → clear index
+ * /rag exclude <pat>    → add gitignore-style pattern (use -<pat> to remove; omit arg to list)
  * /rag on|off           → toggle auto-injection
  * /rag ext list         → list active file extensions
  * /rag ext add <.ext>   → add an extra extension (e.g. .cs, .tex)
@@ -22,7 +23,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
-import { join, extname, basename, relative } from "node:path";
+import { join, extname, basename, relative, resolve } from "node:path";
 import ignore from "ignore";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -93,8 +94,10 @@ interface RagConfig {
   ragTopK: number;
   ragScoreThreshold: number;
   ragAlpha: number; // 0 = pure vector, 1 = pure BM25
-  extraExtensions: string[]; // user-added file extensions (e.g. [".cs", ".tex"])
+  extraExtensions: string[];   // user-added file extensions (e.g. [".cs", ".tex"])
   excludeExtensions: string[]; // extensions to drop from the default set
+  trackedPaths: string[];      // absolute paths previously passed to /rag index
+  excludePatterns: string[];   // gitignore-style path patterns
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -108,7 +111,11 @@ export function loadConfig(): RagConfig {
 }
 
 function defaultConfig(): RagConfig {
-  return { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4, extraExtensions: [], excludeExtensions: [] };
+  return {
+    ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
+    extraExtensions: [], excludeExtensions: [],
+    trackedPaths: [], excludePatterns: [],
+  };
 }
 
 /** Normalize a user-supplied extension to lowercase ".ext" form. */
@@ -245,24 +252,51 @@ export function chunkText(text: string, maxLines = 50): { content: string; lineS
   return chunks;
 }
 
-export function collectFiles(dirPath: string, exts?: Set<string>): string[] {
+export function collectFiles(
+  dirPath: string,
+  exts?: Set<string>,
+  excludePatterns: string[] = [],
+): string[] {
   const allowed = exts ?? resolveExtensions(loadConfig());
+  const ig = excludePatterns.length ? ignore().add(excludePatterns) : null;
   const files: string[] = [];
+  const root = dirPath;
+
   function acceptable(fp: string, size: number): boolean {
     const ext = extname(fp).toLowerCase();
     if (allowed.has(ext)) return size < TEXT_MAX_BYTES;
     if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
     return false;
   }
+
+  function isExcluded(absPath: string): boolean {
+    if (!ig) return false;
+    const rel = relative(root, absPath);
+    if (!rel || rel.startsWith("..")) return false;
+    return ig.ignores(rel);
+  }
+
+  try {
+    const stat = statSync(dirPath);
+    if (stat.isFile()) {
+      if (!acceptable(dirPath, stat.size)) return [];
+      if (ig && ig.ignores(basename(dirPath))) return [];
+      return [dirPath];
+    }
+  } catch { return []; }
+
   function walk(dir: string) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const fp = join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) walk(join(dir, entry.name));
+          if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+          if (isExcluded(fp)) continue;
+          walk(fp);
         } else {
           const ext = extname(entry.name).toLowerCase();
           if (!allowed.has(ext) && !BINARY_DOC_EXTS.has(ext)) continue;
-          const fp = join(dir, entry.name);
+          if (isExcluded(fp)) continue;
           try {
             if (acceptable(fp, statSync(fp).size)) files.push(fp);
           } catch {}
@@ -270,15 +304,29 @@ export function collectFiles(dirPath: string, exts?: Set<string>): string[] {
       }
     } catch {}
   }
-  try {
-    const stat = statSync(dirPath);
-    if (stat.isFile()) {
-      if (!acceptable(dirPath, stat.size)) return [];
-      return [dirPath];
-    }
-  } catch { return []; }
-  walk(dirPath);
+  walk(root);
   return files;
+}
+
+export function collectFromTracked(cfg: RagConfig): string[] {
+  const out = new Set<string>();
+  for (const p of cfg.trackedPaths) {
+    if (!existsSync(p)) continue;
+    for (const f of collectFiles(p, undefined, cfg.excludePatterns)) out.add(f);
+  }
+  return [...out];
+}
+
+/** Returns true if `file` is matched by `excludePatterns` relative to any of `roots`. */
+export function isExcludedByConfig(file: string, roots: string[], excludePatterns: string[]): boolean {
+  if (!excludePatterns.length) return false;
+  const ig = ignore().add(excludePatterns);
+  for (const root of roots) {
+    const rel = relative(root, file);
+    if (!rel || rel.startsWith("..")) continue;
+    if (ig.ignores(rel)) return true;
+  }
+  return false;
 }
 
 // ─── Indexing ─────────────────────────────────────────────────────────────────
@@ -553,7 +601,13 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "index") {
         const path = parts[1] || ".";
         if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
-        const files = collectFiles(path);
+        const config = loadConfig();
+        const absPath = resolve(path);
+        if (!config.trackedPaths.includes(absPath)) {
+          config.trackedPaths.push(absPath);
+          saveConfig(config);
+        }
+        const files = collectFiles(absPath, undefined, config.excludePatterns);
         if (!files.length) { ctx.ui.notify(`No indexable files found in: ${path}`, "warning"); return; }
 
         const total = files.length;
@@ -587,7 +641,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        ctx.ui.notify(`✅ Indexed ${result.indexed} files (${result.chunks} chunks) · ${result.skipped} unchanged · ${secs}s`, "info");
+        ctx.ui.notify(`✅ Indexed ${result.indexed} files (${result.chunks} chunks) · ${result.skipped} unchanged · ${secs}s · tracking ${config.trackedPaths.length} path(s)`, "info");
         return;
       }
 
@@ -633,23 +687,44 @@ export default function (pi: ExtensionAPI) {
       // ── rebuild ──
       if (cmd === "rebuild") {
         const index = loadIndex();
-        const allFiles = Object.keys(index.files);
-        if (!allFiles.length) { ctx.ui.notify("No files in index. Run /rag index <path> first.", "warning"); return; }
+        const config = loadConfig();
+        const indexedFiles = Object.keys(index.files);
+        const trackedFiles = collectFromTracked(config);
 
-        const existingFiles = allFiles.filter(f => existsSync(f));
-        const deletedFiles = allFiles.filter(f => !existsSync(f));
+        // Union of currently-indexed files and files discovered by walking tracked paths.
+        const targetSet = new Set<string>([...trackedFiles]);
+        for (const f of indexedFiles) {
+          if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+            targetSet.add(f);
+          }
+        }
+        const targetFiles = [...targetSet];
 
-        // Prune deleted files
-        for (const f of deletedFiles) {
+        if (!targetFiles.length && !indexedFiles.length) {
+          ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
+          return;
+        }
+
+        // Files in the index but no longer present (deleted, excluded, or untracked).
+        const droppedFiles = indexedFiles.filter(f => !targetSet.has(f));
+        for (const f of droppedFiles) {
           index.chunks = index.chunks.filter(c => c.file !== f);
           delete index.files[f];
         }
-        // Force re-embed all existing files
-        for (const f of existingFiles) { if (index.files[f]) index.files[f].embedded = false; }
+
+        // Force re-embed all target files (treat new ones as not yet embedded).
+        for (const f of targetFiles) {
+          if (index.files[f]) index.files[f].embedded = false;
+        }
         saveIndex(index);
 
-        if (deletedFiles.length) ctx.ui.notify(`Pruned ${deletedFiles.length} deleted files`, "info");
-        ctx.ui.notify(`Rebuilding ${existingFiles.length} files...`, "info");
+        const newFiles = targetFiles.filter(f => !indexedFiles.includes(f));
+        if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+        if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+        ctx.ui.notify(`Rebuilding ${targetFiles.length} files...`, "info");
+
+        const existingFiles = targetFiles;
+        const deletedFiles = droppedFiles;
 
         function progressBar(n: number, total: number, width = 24): string {
           const filled = Math.round((n / total) * width);
@@ -744,6 +819,49 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // ── exclude ──
+      if (cmd === "exclude") {
+        const config = loadConfig();
+        const expr = parts.slice(1).join(" ").trim();
+        const th = ctx.ui.theme;
+
+        if (!expr) {
+          if (!config.excludePatterns.length) {
+            ctx.ui.notify("No exclude patterns set. Add one with: /rag exclude <pattern>", "info");
+            return;
+          }
+          const lines: string[] = [
+            th.bold(`Exclude patterns (${config.excludePatterns.length})`),
+            "",
+          ];
+          for (const p of config.excludePatterns) lines.push("  " + th.fg("muted", p));
+          ctx.ui.setWidget("rag-exclude", lines);
+          return;
+        }
+
+        if (expr.startsWith("-")) {
+          const target = expr.slice(1);
+          const before = config.excludePatterns.length;
+          config.excludePatterns = config.excludePatterns.filter(p => p !== target);
+          if (config.excludePatterns.length === before) {
+            ctx.ui.notify(`Pattern not found: ${target}`, "warning");
+            return;
+          }
+          saveConfig(config);
+          ctx.ui.notify(`✅ Removed exclude: ${target} · ${config.excludePatterns.length} pattern(s) remain. Run /rag rebuild to re-apply.`, "info");
+          return;
+        }
+
+        if (config.excludePatterns.includes(expr)) {
+          ctx.ui.notify(`Already excluded: ${expr}`, "warning");
+          return;
+        }
+        config.excludePatterns.push(expr);
+        saveConfig(config);
+        ctx.ui.notify(`✅ Added exclude: ${expr} · ${config.excludePatterns.length} pattern(s) total. Run /rag rebuild to re-apply.`, "info");
+        return;
+      }
+
       // ── find ──
       if (cmd === "find") {
         const glob = parts.slice(1).join(" ").trim();
@@ -786,8 +904,9 @@ export default function (pi: ExtensionAPI) {
           ["/rag search <query>",     "Hybrid BM25 + vector search over the index"],
           ["/rag find <glob>",        "List indexed files matching a glob (e.g. *.ts, src/*)"],
           ["/rag status",             "Show index stats and active configuration"],
-          ["/rag rebuild",            "Re-embed all previously indexed files"],
+          ["/rag rebuild",            "Re-embed all tracked files; picks up new files in tracked paths"],
           ["/rag clear",              "Delete all indexed chunks"],
+          ["/rag exclude <pattern>",  "Add a gitignore-style exclude pattern (omit to list; -<pattern> to remove)"],
           ["/rag ext list|add|remove|reset", "Manage the indexable file-extension allowlist"],
           ["/rag on",                 "Enable automatic RAG injection before each agent turn"],
           ["/rag off",                "Disable automatic RAG injection"],
@@ -838,6 +957,21 @@ export default function (pi: ExtensionAPI) {
           lines.push("    " + th.fg("muted", ext) + "  " + th.fg("dim", String(count)));
         }
       }
+
+      lines.push("", "  " + th.bold("Tracked paths:"));
+      if (config.trackedPaths.length) {
+        for (const p of config.trackedPaths) lines.push("    " + th.fg("muted", p));
+      } else {
+        lines.push("    " + th.fg("dim", "(none — run /rag index <path> to track)"));
+      }
+
+      lines.push("", "  " + th.bold("Exclude patterns:"));
+      if (config.excludePatterns.length) {
+        for (const p of config.excludePatterns) lines.push("    " + th.fg("muted", p));
+      } else {
+        lines.push("    " + th.fg("dim", "(none — add with /rag exclude <pattern>)"));
+      }
+
       ctx.ui.setWidget("rag-status", lines);
     },
   });
@@ -853,7 +987,13 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, params) => {
       if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }], details: undefined };
-      const files = collectFiles(params.path);
+      const config = loadConfig();
+      const absPath = resolve(params.path);
+      if (!config.trackedPaths.includes(absPath)) {
+        config.trackedPaths.push(absPath);
+        saveConfig(config);
+      }
+      const files = collectFiles(absPath, undefined, config.excludePatterns);
       if (!files.length) return { content: [{ type: "text" as const, text: `No indexable files found in: ${params.path}` }], details: undefined };
       const result = await indexFiles(files, {});
       process.stderr.write(`\n`);
