@@ -80,6 +80,32 @@ test("extractText: extracts text from a .docx", async () => {
   }
 });
 
+test("extractText: silences pdfjs Warning/Info console output during PDF parse", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "rag-extract-"));
+  try {
+    const fp = join(tmp, "loud.pdf");
+    writeFileSync(fp, SAMPLE_PDF);
+    const leaked: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => {
+      const first = args[0];
+      if (typeof first === "string" && /^(Warning|Info|Deprecated API usage):/.test(first)) {
+        leaked.push(first);
+      }
+      // intentionally drop everything during the test to keep test output clean
+    };
+    try {
+      const r = await extractText(fp);
+      assert.ok(r.text.includes("RagPdfMarker"), "text extraction must still work");
+    } finally {
+      console.log = origLog;
+    }
+    assert.equal(leaked.length, 0, `expected 0 pdfjs warnings, got ${leaked.length}: ${leaked.slice(0, 3).join(" | ")}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("extractText: hash is stable across reads of the same binary file (skip-on-rebuild)", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "rag-extract-"));
   try {

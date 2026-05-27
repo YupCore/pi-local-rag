@@ -281,6 +281,28 @@ export function collectFiles(dirPath: string, exts?: Set<string>): string[] {
 
 // ─── Indexing ─────────────────────────────────────────────────────────────────
 
+// pdfjs (bundled inside pdf-parse) routes warnings through console.log with a
+// "Warning: " prefix. On real-world PDFs this fires thousands of times per
+// document ("Ran out of space in font private use area", missing glyphs, …).
+// The font warnings come from pdf.worker.js, which is a separate webpack
+// bundle whose verbosity is not externally configurable (its setVerbosityLevel
+// export exists only as a placeholder at the outer module level). Filtering
+// console.log for the known pdfjs prefixes is the only reliable approach.
+const PDFJS_LOG_PREFIX = /^(Warning|Info|Deprecated API usage):/;
+async function withPdfjsSilenced<T>(fn: () => Promise<T>): Promise<T> {
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === "string" && PDFJS_LOG_PREFIX.test(first)) return;
+    origLog(...args);
+  };
+  try {
+    return await fn();
+  } finally {
+    console.log = origLog;
+  }
+}
+
 /**
  * Read and decode a file into UTF-8 text. PDF and DOCX are routed through
  * extraction libraries; everything else is read as plain UTF-8. Hash is
@@ -292,7 +314,7 @@ export async function extractText(fp: string): Promise<{ text: string; hash: str
   if (ext === ".pdf") {
     const buf = readFileSync(fp);
     const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
-    const data = await pdf(buf);
+    const data = await withPdfjsSilenced(() => pdf(buf));
     return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
   }
   if (ext === ".docx") {
