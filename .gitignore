@@ -5,3 +5,4 @@ node_modules/
 *.map
 .DS_Store
 coverage/
+FORK_WORK.md

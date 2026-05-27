@@ -777,59 +777,9 @@ describe("/rag find glob matching", () => {
 
 // ─── embed + hybrid (real ONNX pipeline; opt-out via SKIP_EMBEDDING_TESTS) ──
 
-describe("embed (real ONNX)", () => {
-  const skip = process.env.SKIP_EMBEDDING_TESTS === "1";
-  const EMBED_TIMEOUT = 120_000;
-
-  it.skipIf(skip)("returns a 384-dim unit-normalized vector for a single string", async () => {
-    const v = await embed("hello world");
-    expect(Array.isArray(v)).toBe(true);
-    expect(v.length).toBe(384);
-    const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
-    expect(Math.abs(norm - 1)).toBeLessThan(1e-3);
-    expect(v.some(x => x !== 0)).toBe(true);
-  }, EMBED_TIMEOUT);
-
-  it.skipIf(skip)("deterministic — same input produces same output", async () => {
-    const a = await embed("the quick brown fox jumps over the lazy dog");
-    const b = await embed("the quick brown fox jumps over the lazy dog");
-    expect(a.length).toBe(b.length);
-    for (let i = 0; i < a.length; i++) {
-      expect(Math.abs(a[i] - b[i])).toBeLessThan(1e-6);
-    }
-  }, EMBED_TIMEOUT);
-
-  it.skipIf(skip)("semantic similarity — related sentences are closer than unrelated ones", async () => {
-    const cat = await embed("A cat sits on the windowsill watching birds.");
-    const kitten = await embed("A small kitten is looking at sparrows through the window.");
-    const finance = await embed("Quarterly revenue exceeded analyst expectations by twelve percent.");
-    const simRelated = cosineSimilarity(cat, kitten);
-    const simUnrelated = cosineSimilarity(cat, finance);
-    expect(simRelated).toBeGreaterThan(simUnrelated + 0.1);
-    expect(simRelated).toBeGreaterThan(0.5);
-  }, EMBED_TIMEOUT);
-
-  it.skipIf(skip)("hybridSearch: vector path retrieves semantically relevant chunks even without keyword overlap", async () => {
-    const chunks = [
-      { content: "Photosynthesis is how plants convert sunlight into chemical energy.", file: "plants.md" },
-      { content: "The team shipped a new dashboard for analytics reporting.", file: "shipping.md" },
-      { content: "We pickled cucumbers in a vinegar brine with dill and garlic.", file: "recipe.md" },
-    ];
-    const vectors = await Promise.all(chunks.map(c => embed(c.content)));
-    const index = {
-      chunks: chunks.map((c, i) => ({
-        id: `${c.file}-1`, file: c.file, content: c.content,
-        lineStart: 1, lineEnd: 1, hash: "x",
-        indexed: "2026-05-15T00:00:00Z", tokens: Math.ceil(c.content.length / 4),
-        vector: vectors[i],
-      })),
-      files: {}, lastBuild: "",
-    };
-    const results = await hybridSearch("How do leaves produce food from light?", index, 3, 0);
-    expect(results.length).toBeGreaterThan(0);
-    expect(results[0].chunk.file).toBe("plants.md");
-  }, EMBED_TIMEOUT);
-});
+// (Real-ONNX embed + vector-path hybridSearch tests live in __tests__/embedding.test.ts —
+// that file deliberately doesn't mock @xenova/transformers, matching the
+// fork's split between index.test.ts (mocked) and embedding.test.ts (real).)
 
 // ─── Storage: loadConfig / saveConfig / loadIndex / saveIndex / ensureDir ───
 //
