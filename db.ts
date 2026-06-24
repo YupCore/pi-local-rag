@@ -49,30 +49,63 @@ export interface IndexStats {
   embeddingModel: string;
 }
 
-export function openDb(ragDir?: string): Database.Database {
-  const dir = ragDir ?? getRagDir();
-  ensureDir(dir);
-  const path = dbFile(dir);
-  const db = new Database(path);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  loadVec(db);
-  initSchema(db);
+export class RagDatabase {
+  private static _instance: Database.Database | null = null;
+  private constructor() {}
 
-  const legacyPath = legacyIndexFile(dir);
-  if (existsSync(legacyPath)) {
-    const chunkCount = db.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number };
-    if (chunkCount.c === 0) {
-      migrateFromJson(db, legacyPath);
+  static get instance(): Database.Database {
+    return RagDatabase._instance ??= RagDatabase.open();
+  }
+
+  static get isOpen(): boolean { return RagDatabase._instance !== null; }
+
+  static close(): void {
+    const db = RagDatabase._instance;
+    RagDatabase._instance = null;
+    try {
+      db?.close();
+    } catch (err) {
+      process.stderr.write(`[rag] closeDb() failed: ${(err as Error).message}\n`);
     }
   }
 
-  return db;
+  static open(ragDir?: string): Database.Database {
+    const dir = ragDir ?? getRagDir();
+    ensureDir(dir);
+    const path = dbFile(dir);
+    const db = new Database(path);
+    db.pragma("journal_mode = WAL");
+    db.pragma("foreign_keys = ON");
+    loadVec(db);
+    initSchema(db);
+
+    const legacyPath = legacyIndexFile(dir);
+    if (existsSync(legacyPath)) {
+      const chunkCount = db.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number };
+      if (chunkCount.c === 0) {
+        migrateFromJson(db, legacyPath);
+      }
+    }
+
+    return db;
+  }
+
+  static getFreshDbConn(ragDir?: string): Database.Database & Disposable {
+    const db = RagDatabase.open(ragDir);
+    return Object.assign(db, {
+      [Symbol.dispose]: () => db.close(),
+    });
+  }
 }
 
-export function getDb(): Database.Database {
-  return openDb();
-}
+export const getDbConn   = () => RagDatabase.instance;
+export const closeDbConn = () => { RagDatabase.close(); };
+
+/**
+ * Returns a brand-new, throwaway DB connection. **Bypasses the singleton** —
+ * the caller is responsible for closing it. Use `getDbConn()` for normal access.
+ */
+export const getFreshDbConn = (dir?: string) => RagDatabase.getFreshDbConn(dir);
 
 export function initSchema(db: Database.Database) {
   db.exec(`DROP TRIGGER IF EXISTS chunks_ai; DROP TRIGGER IF EXISTS chunks_ad;`);
@@ -178,31 +211,26 @@ export function float32ToBuffer(arr: number[]): Buffer {
 }
 
 export function getIndexStats(db?: Database.Database): IndexStats {
-  const dbConn = db ?? getDb();
-  const shouldClose = !db;
-  try {
-    const chunkRow = dbConn.prepare(`
-      SELECT COUNT(*) as totalChunks,
-            COALESCE(SUM(tokens), 0) as totalTokens
-      FROM chunks
-    `).get() as { totalChunks: number; totalTokens: number };
+  const dbConn = db ?? getDbConn();
+  const chunkRow = dbConn.prepare(`
+    SELECT COUNT(*) as totalChunks,
+          COALESCE(SUM(tokens), 0) as totalTokens
+    FROM chunks
+  `).get() as { totalChunks: number; totalTokens: number };
 
-    const fileRow = dbConn.prepare("SELECT COUNT(*) as totalFiles FROM files").get() as { totalFiles: number };
-    const vecRow = dbConn.prepare("SELECT COUNT(*) as embeddedCount FROM chunks_vec").get() as { embeddedCount: number };
-    const lastBuild = dbConn.prepare("SELECT value FROM metadata WHERE key = 'last_build'").get() as { value?: string } | undefined;
-    const embeddingModel = dbConn.prepare("SELECT value FROM metadata WHERE key = 'embedding_model'").get() as { value?: string } | undefined;
+  const fileRow = dbConn.prepare("SELECT COUNT(*) as totalFiles FROM files").get() as { totalFiles: number };
+  const vecRow = dbConn.prepare("SELECT COUNT(*) as embeddedCount FROM chunks_vec").get() as { embeddedCount: number };
+  const lastBuild = dbConn.prepare("SELECT value FROM metadata WHERE key = 'last_build'").get() as { value?: string } | undefined;
+  const embeddingModel = dbConn.prepare("SELECT value FROM metadata WHERE key = 'embedding_model'").get() as { value?: string } | undefined;
 
-    return {
-      totalChunks: chunkRow.totalChunks,
-      totalFiles: fileRow.totalFiles,
-      totalTokens: chunkRow.totalTokens,
-      embeddedCount: vecRow.embeddedCount,
-      lastBuild: lastBuild?.value ?? "",
-      embeddingModel: embeddingModel?.value ?? "",
-    };
-  } finally {
-    if (shouldClose) dbConn.close();
-  }
+  return {
+    totalChunks: chunkRow.totalChunks,
+    totalFiles: fileRow.totalFiles,
+    totalTokens: chunkRow.totalTokens,
+    embeddedCount: vecRow.embeddedCount,
+    lastBuild: lastBuild?.value ?? "",
+    embeddingModel: embeddingModel?.value ?? "",
+  };
 }
 
 /** No-op shim — JSON-era callers (and tests) compile against this. SQLite
@@ -211,51 +239,37 @@ export function getIndexStats(db?: Database.Database): IndexStats {
 export function saveIndex(_index: IndexMeta) { /* writes are transactional in indexFiles */ }
 
 export function loadIndex(): IndexMeta {
-  const db = getDb();
-  try {
-    const chunks = db.prepare(`
-      SELECT c.id, c.file_path as file, c.chunk_content as content,
-             c.line_start as lineStart, c.line_end as lineEnd,
-             c.chunk_hash as hash, c.indexed_at as indexed, c.tokens
-      FROM chunks c
-    `).all() as Chunk[];
+  const db = getDbConn();
+  const chunks = db.prepare(`
+    SELECT c.id, c.file_path as file, c.chunk_content as content,
+            c.line_start as lineStart, c.line_end as lineEnd,
+            c.chunk_hash as hash, c.indexed_at as indexed, c.tokens
+    FROM chunks c
+  `).all() as Chunk[];
 
-    const filesRaw = db.prepare("SELECT * FROM files").all() as Array<FileDbEntry>;
-    const files: IndexMeta["files"] = {};
-    for (const f of filesRaw) {
-      files[f.path] = { hash: f.hash, chunks: f.chunks, indexed: f.indexed, size: f.size, embedded: !!f.embedded };
-    }
-
-    const lastBuild = db.prepare("SELECT value FROM metadata WHERE key = 'last_build'").get() as { value?: string } | undefined;
-    const embeddingModel = db.prepare("SELECT value FROM metadata WHERE key = 'embedding_model'").get() as { value?: string } | undefined;
-
-    return {
-      chunks, files,
-      lastBuild: lastBuild?.value ?? "",
-      embeddingModel: embeddingModel?.value,
-    };
-  } finally {
-    db.close();
+  const filesRaw = db.prepare("SELECT * FROM files").all() as Array<FileDbEntry>;
+  const files: IndexMeta["files"] = {};
+  for (const f of filesRaw) {
+    files[f.path] = {hash: f.hash, chunks: f.chunks, indexed: f.indexed, size: f.size, embedded: !!f.embedded};
   }
+
+  const lastBuild = db.prepare("SELECT value FROM metadata WHERE key = 'last_build'").get() as { value?: string } | undefined;
+  const embeddingModel = db.prepare("SELECT value FROM metadata WHERE key = 'embedding_model'").get() as { value?: string } | undefined;
+
+  return {
+    chunks, files,
+    lastBuild: lastBuild?.value ?? "",
+    embeddingModel: embeddingModel?.value,
+  };
 }
 
-export function getEmbeddedCount(db?: Database.Database): number {
-  const dbConn = db ?? getDb();
-  const shouldClose = !db;
-  try {
-    const vecRow = dbConn.prepare("SELECT COUNT(*) as embeddedCount FROM chunks_vec").get() as { embeddedCount: number };
-    return vecRow.embeddedCount;
-  } finally {
-    if (shouldClose) dbConn.close();
-  }
+export function getEmbeddedCount(): number {
+  const db = getDbConn();
+  const vecRow = db.prepare("SELECT COUNT(*) as embeddedCount FROM chunks_vec").get() as { embeddedCount: number };
+  return vecRow.embeddedCount;
 }
 
-export function getIndexedFiles(db?: Database.Database): FileDbEntry[] {
-  const dbConn = db ?? getDb();
-  const shouldClose = !db;
-  try {
-    return dbConn.prepare("SELECT * FROM files").all() as FileDbEntry[];
-  } finally {
-    if (shouldClose) dbConn.close();
-  }
+export function getIndexedFiles(): FileDbEntry[] {
+  const db = getDbConn();
+  return (db.prepare("SELECT * FROM files").all() as Array<FileDbEntry>);
 }

@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import Database from "better-sqlite3";
-import { openDb, float32ToBuffer, type IndexStats } from "./db.ts";
+import { getDbConn, float32ToBuffer, type IndexStats } from "./db.ts";
 import { EMBEDDING_MODEL } from "./constants.ts";
 import { embedBatch } from "./embed.ts";
 import { chunkText, extractText, sha256 } from "./chunking.ts";
@@ -46,7 +46,7 @@ export async function indexFiles(
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
   const hadCallbacks = !!progress;
   if (hadCallbacks) _suppressStderr = true;
-  const database = _db ?? openDb();
+  const database = _db ?? getDbConn();
   const startMs = Date.now();
   const total = paths.length;
 

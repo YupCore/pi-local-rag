@@ -144,6 +144,13 @@ function chunkFixture(file: string, content: string, lineStart = 1) {
   };
 }
 
+// ─── Test lifecycle: close the cached DB singleton after every test ──────────
+// Close the cached DB singleton after every test so it can't leak into the next test
+afterEach(async () => {
+  const { closeDbConn } = await import("../db.ts");
+  closeDbConn();
+});
+
 // ─── chunkText ──────────────────────────────────────────────────────────────
 
 describe("chunkText", () => {
@@ -1019,12 +1026,11 @@ describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => 
   });
 
   it("loadIndex: reconstructs IndexMeta from chunks + files + metadata in the DB", async () => {
-    // Insert directly via the same openDb the rest of the system uses, then
-    // read back through loadIndex. This replaces the old saveIndex/loadIndex
-    // round-trip — saveIndex is now a no-op (writes are transactional in
-    // indexFiles); loadIndex hydrates the legacy IndexMeta shape from SQLite.
+    // Insert directly via a fresh (non-singleton) connection, then read back
+    // through loadIndex. saveIndex is now a no-op (writes are transactional
+    // in indexFiles); loadIndex hydrates the legacy IndexMeta shape from SQLite.
     const mod = await import("../index.ts");
-    const db = mod.openDb();
+    const db = mod.getFreshDbConn();
     try {
       const r = db.prepare(`
         INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
@@ -1181,7 +1187,7 @@ describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store onl
     // Populate the legacy dir at the fake home so migration has work to do.
     // Under SQLite this exercises two migration paths in sequence:
     //   1. ensureDir() renames ~/.pi/lens → ~/.pi/rag (dir rename)
-    //   2. openDb() spots the moved index.json inside ~/.pi/rag and imports
+    //   2. getFreshDbConn() spots the moved index.json inside ~/.pi/rag and imports
     //      its contents into rag.db, then unlinks the JSON file.
     // migrateFromJson skips the import when chunks.length === 0, so the
     // fixture has at least one chunk so we can observe the round-trip.
@@ -1221,7 +1227,7 @@ describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store onl
     expect(idx.chunks[0].content).toBe("from-legacy-payload");
     expect(existsSync(join(fakeHome, ".pi", "rag"))).toBe(true);
     expect(existsSync(join(fakeHome, ".pi", "lens"))).toBe(false);
-    // index.json should have been consumed by openDb's auto-migration.
+    // index.json should have been consumed by getFreshDbConn's auto-migration.
     expect(existsSync(join(fakeHome, ".pi", "rag", "index.json"))).toBe(false);
     // The DB itself should exist now.
     expect(existsSync(join(fakeHome, ".pi", "rag", "rag.db"))).toBe(true);
@@ -1286,7 +1292,7 @@ describe("before_agent_start: 24h auto-refresh", () => {
 
   /** Write a single chunk + file row + lastBuild directly into the DB. */
   function seedIndex(opts: { filePath: string; lastBuild: string; fileHash?: string }) {
-    const db = mod.openDb();
+    const db = mod.getFreshDbConn();
     try {
       // Clear so each test starts clean.
       db.exec(`DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files; DELETE FROM metadata;`);
@@ -1310,7 +1316,7 @@ describe("before_agent_start: 24h auto-refresh", () => {
   }
 
   function readLastBuild(): string {
-    const db = mod.openDb();
+    const db = mod.getFreshDbConn();
     try {
       const row = db.prepare("SELECT value FROM metadata WHERE key='last_build'").get() as { value?: string } | undefined;
       return row?.value ?? "";
@@ -1368,5 +1374,58 @@ describe("before_agent_start: 24h auto-refresh", () => {
     extensionFactory(pi as any);
     await fire();
     expect(readLastBuild()).toBe(staleBuild);
+  });
+});
+
+// ─── getFreshDbConn: [Symbol.dispose] support ────────────────────────────────
+//
+// These tests verify the `using` declaration works with getFreshDbConn() and
+// that the connection is automatically closed when the block scope exits —
+// including the exception path. This is the C# `using` / Java try-with-resources
+// pattern, adapted for TypeScript.
+describe("getFreshDbConn: [Symbol.dispose] for `using` declaration", () => {
+  let mod: typeof import("../index.ts");
+
+  beforeAll(async () => {
+    mod = await import("../index.ts");
+  });
+
+  it("attaches [Symbol.dispose] to the returned connection", () => {
+    using db = mod.getFreshDbConn();
+    expect(typeof db[Symbol.dispose]).toBe("function");
+  });
+
+  it("closes the connection when the `using` block exits normally", () => {
+    let captured: ReturnType<typeof mod.getFreshDbConn> | null = null;
+    {
+      using db = mod.getFreshDbConn();
+      captured = db;
+      // Connection is open and usable inside the block.
+      expect(db.prepare("SELECT 1 as one").get()).toEqual({ one: 1 });
+    }
+    // After the block, the connection must be closed.
+    expect(() => captured!.prepare("SELECT 1").get()).toThrow(/not open|database/i);
+  });
+
+  it("closes the connection even when an exception is thrown inside the block", () => {
+    let captured: ReturnType<typeof mod.getFreshDbConn> | null = null;
+    expect(() => {
+      {
+        using db = mod.getFreshDbConn();
+        captured = db;
+        throw new Error("boom");
+      }
+    }).toThrow("boom");
+    // The dispose ran via the `using` machinery despite the throw.
+    expect(() => captured!.prepare("SELECT 1").get()).toThrow(/not open|database/i);
+  });
+
+  it("returned object is the same Database instance (mutated, not copied)", () => {
+    using db = mod.getFreshDbConn();
+    // prepare() is a prototype method on better-sqlite3 Database; the
+    // Object.assign wrapper preserves them all.
+    expect(typeof db.prepare).toBe("function");
+    expect(typeof db.close).toBe("function");
+    expect(typeof db.pragma).toBe("function");
   });
 });

@@ -15,7 +15,7 @@
  *
  * Set SKIP_EMBEDDING_TESTS=1 to skip (e.g. in offline CI).
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
 import {
@@ -24,6 +24,12 @@ import {
 
 const skip = process.env.SKIP_EMBEDDING_TESTS === "1";
 const EMBED_TIMEOUT = 120_000;
+
+// Close the cached DB singleton after every test so it can't leak into the next test
+afterEach(async () => {
+  const { closeDbConn } = await import("../db.ts");
+  closeDbConn();
+});
 
 describe("embed (real ONNX)", () => {
   it.skipIf(skip)("returns a 384-dim unit-normalized vector for a single string", async () => {

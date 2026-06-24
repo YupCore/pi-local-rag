@@ -46,7 +46,7 @@ import ignore from "ignore";
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { openDb, getIndexedFiles, getEmbeddedCount, saveIndex, getIndexStats } from "./db.ts";
+import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, saveIndex, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
@@ -58,7 +58,7 @@ export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
 export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
-export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
+export { getFreshDbConn, getDbConn, closeDbConn, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
 export {
   sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
   isExcludedByConfig, extractText, getOcrTooling, isSparsePdfText,
@@ -83,30 +83,28 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const database = openDb();
-    try {
-      const indexStats = getIndexStats(database);
-      if (indexStats.totalChunks === 0) return;
+    const indexStats = getIndexStats();
+    if (indexStats.totalChunks === 0) return;
 
-      const now = Date.now();
-      if (isIndexStale(indexStats) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
-        lastStaleCheckMs = now;
-        // Re-walk tracked paths so new files (and files of newly-supported
-        // extensions, e.g. PDF/DOCX added in a later version) are picked up.
-        // For pre-trackedPaths indexes, fall back to refreshing only known files.
-        const files = config.trackedPaths.length
-          ? collectFromTracked(config)
-          : getIndexedFiles(database).map(f => f.path).filter(f => existsSync(f));
-        if (files.length) {
-          process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
-          await indexFiles(files, undefined, database);
-          process.stderr.write(`\r\x1b[2K`);
-        }
+    const now = Date.now();
+    if (isIndexStale(indexStats) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+      lastStaleCheckMs = now;
+      // Re-walk tracked paths so new files (and files of newly-supported
+      // extensions, e.g. PDF/DOCX added in a later version) are picked up.
+      // For pre-trackedPaths indexes, fall back to refreshing only known files.
+      const files = config.trackedPaths.length
+        ? collectFromTracked(config)
+        : getIndexedFiles().map(f => f.path).filter(f => existsSync(f));
+      if (files.length) {
+        process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
+        await indexFiles(files, undefined);
+        process.stderr.write(`\r\x1b[2K`);
       }
+    }
 
-      const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha, database);
-      const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
-      if (!relevant.length) return;
+    const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha);
+    const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
+    if (!relevant.length) return;
 
     const context = relevant.map(r =>
       `### ${basename(r.chunk.file)} (lines ${r.chunk.lineStart}-${r.chunk.lineEnd})\n` +
@@ -130,9 +128,10 @@ export default function (pi: ExtensionAPI) {
           display: false,
         },
       };
-    } finally {
-      database.close();
-    }
+  });
+
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    closeDbConn();
   });
 
   // ── /rag command ──
@@ -259,101 +258,98 @@ export default function (pi: ExtensionAPI) {
         const rebuildArgs = parts.slice(1);
         const force = rebuildArgs.includes("--force");
 
-        const database = openDb();
+        const database = getDbConn();
         const config = loadConfig();
-        try {
-          const indexedRows = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
-          const indexedFileSet = new Set(indexedRows.map(f => f.path));
+        const indexedRows = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
+        const indexedFileSet = new Set(indexedRows.map(f => f.path));
 
-          // Walking tracked paths can stall the event loop on large trees
-          // (45k+ files). Use the async variant + yield up-front so the user
-          // gets immediate feedback before the heavy work begins.
-          ctx.ui.notify("Scanning tracked paths...", "info");
-          const trackedFiles = await collectFromTrackedAsync(config);
+        // Walking tracked paths can stall the event loop on large trees
+        // (45k+ files). Use the async variant + yield up-front so the user
+        // gets immediate feedback before the heavy work begins.
+        ctx.ui.notify("Scanning tracked paths...", "info");
+        const trackedFiles = await collectFromTrackedAsync(config);
 
-          // Union of currently-indexed files and files discovered by walking tracked paths.
-          const targetSet = new Set<string>([...trackedFiles]);
-          for (const f of indexedFileSet) {
-            if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
-              targetSet.add(f);
-            }
+        // Union of currently-indexed files and files discovered by walking tracked paths.
+        const targetSet = new Set<string>([...trackedFiles]);
+        for (const f of indexedFileSet) {
+          if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+            targetSet.add(f);
           }
-          const targetFiles = [...targetSet];
-
-          if (!targetFiles.length && !indexedFileSet.size) {
-            ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
-            return;
-          }
-
-          // Files in the index but no longer present (deleted, excluded, or untracked).
-          const droppedFiles = [...indexedFileSet].filter(f => !targetSet.has(f));
-          for (const f of droppedFiles) {
-            database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)").run(f);
-            database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
-            database.prepare("DELETE FROM files WHERE path = ?").run(f);
-          }
-          if (force) {
-            // --force: wipe everything and rebuild the FTS index. indexFiles
-            // will then insert fresh rows for every targetFile, bypassing the
-            // skip-on-equal-hash check.
-            database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
-            database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
-          } else {
-            for (const f of targetFiles) {
-              database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
-            }
-          }
-
-          const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
-          ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
-          if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
-          if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
-
-          // Yield so the TUI can paint the "Rebuilding" message before
-          // indexFiles starts hammering the event loop.
-          await new Promise<void>(r => setTimeout(r, 0));
-
-          function progressBar(n: number, total: number, width = 24): string {
-            const filled = Math.round((n / total) * width);
-            return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
-          }
-
-          const result = await indexFiles(targetFiles, {
-            onFile(current, total, filename, skipped) {
-              const pct = Math.round((current / total) * 100);
-              const bar = progressBar(current, total);
-              ctx.ui.setStatus("rag", `■ Rebuilding ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
-              ctx.ui.setWidget("rag", [
-                `${B}${CYAN}Rebuilding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-                `${D}file:    ${RST}${filename}`,
-                `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
-              ]);
-            },
-            onEmbed(done, total) {
-              const pct = Math.round((done / total) * 100);
-              const bar = progressBar(done, total);
-              ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
-              ctx.ui.setWidget("rag", [
-                `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-                `${D}chunks:  ${RST}${done}/${total}`,
-              ]);
-            },
-            onChunk(ci, total, filename) {
-              ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
-            },
-            onSave() {
-              ctx.ui.setStatus("rag", `■ Saving index...`);
-            },
-          }, database, force);
-
-          ctx.ui.setStatus("rag", undefined);
-          ctx.ui.setWidget("rag", undefined);
-
-          const secs = (result.durationMs / 1000).toFixed(1);
-          ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
-        } finally {
-          database.close();
         }
+        const targetFiles = [...targetSet];
+
+        if (!targetFiles.length && !indexedFileSet.size) {
+          ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
+          return;
+        }
+
+        // Files in the index but no longer present (deleted, excluded, or untracked).
+        const droppedFiles = [...indexedFileSet].filter(f => !targetSet.has(f));
+        for (const f of droppedFiles) {
+          database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)").run(f);
+          database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
+          database.prepare("DELETE FROM files WHERE path = ?").run(f);
+        }
+        if (force) {
+          // --force: wipe everything and rebuild the FTS index. indexFiles
+          // will then insert fresh rows for every targetFile, bypassing the
+          // skip-on-equal-hash check.
+          database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
+          database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
+        } else {
+          for (const f of targetFiles) {
+            database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
+          }
+        }
+
+        const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
+        ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
+        if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+        if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+
+        // Yield so the TUI can paint the "Rebuilding" message before
+        // indexFiles starts hammering the event loop.
+        await new Promise<void>(r => setTimeout(r, 0));
+
+        function progressBar(n: number, total: number, width = 24): string {
+          const filled = Math.round((n / total) * width);
+          return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
+        }
+
+        const result = await indexFiles(targetFiles, {
+          onFile(current, total, filename, skipped) {
+            const pct = Math.round((current / total) * 100);
+            const bar = progressBar(current, total);
+            ctx.ui.setStatus("rag", `■ Rebuilding ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
+            ctx.ui.setWidget("rag", [
+              `${B}${CYAN}Rebuilding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+              `${D}file:    ${RST}${filename}`,
+              `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
+            ]);
+          },
+          onEmbed(done, total) {
+            const pct = Math.round((done / total) * 100);
+            const bar = progressBar(done, total);
+            ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+            ctx.ui.setWidget("rag", [
+              `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+              `${D}chunks:  ${RST}${done}/${total}`,
+            ]);
+          },
+          onChunk(ci, total, filename) {
+            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+          },
+          onSave() {
+            ctx.ui.setStatus("rag", `■ Saving index...`);
+          },
+        }, database, force);
+
+        ctx.ui.setStatus("rag", undefined);
+        ctx.ui.setWidget("rag", undefined);
+
+        const secs = (result.durationMs / 1000).toFixed(1);
+        ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
+
         return;
       }
 
@@ -569,7 +565,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── status (default) ──
-      const statusDb = openDb();
+      const statusDb = getDbConn();
       try {
       const indexStats = getIndexStats(statusDb);
       const config = loadConfig();
@@ -601,7 +597,7 @@ export default function (pi: ExtensionAPI) {
 
       if (fileCount) {
         lines.push("", "  " + th.bold("File types:"));
-        const files = getIndexedFiles(statusDb);
+        const files = getIndexedFiles();
         const byExt: Record<string, number> = {};
         for (const f of files.map(f => f.path)) byExt[extname(f)] = (byExt[extname(f)] || 0) + 1;
         for (const [ext, count] of Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
