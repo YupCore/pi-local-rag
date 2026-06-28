@@ -1296,6 +1296,48 @@ describe("before_agent_start: 24h auto-refresh", () => {
     await fire();
     expect(readLastBuild()).toBe(staleBuild);
   });
+
+  // ── error routing ─────────────────────────────────────────────────────────
+
+  it("catches EmbedError from hybridSearch and routes to ctx.ui.notify (no rethrow)", async () => {
+    // Seed a fresh index so the hook actually tries to search.
+    const freshBuild = new Date(Date.now() - 60_000).toISOString();
+    seedIndex({ filePath: "/some/file.ts", lastBuild: freshBuild });
+
+    // Override fetch to make hybridSearch's embed() throw EmbedError.
+    currentFetchImpl = (async () => new Response("forbidden", { status: 401 })) as typeof fetch;
+
+    const ctx = {
+      ui: {
+        notify: vi.fn(),
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+      },
+    };
+
+    // Capture the hook so we can pass our custom ctx.
+    let hookFn: ((event: any, ctx: any) => Promise<any>) | undefined;
+    const pi = {
+      on: (event: string, fn: any) => { if (event === "before_agent_start") hookFn = fn; },
+      registerCommand: () => {},
+      registerTool: () => {},
+      sendMessage: () => {},
+    };
+    extensionFactory(pi as any);
+
+    // Must NOT throw.
+    const out = await hookFn!({ prompt: "hello", systemPrompt: "" }, ctx);
+
+    // Hook returned undefined (no RAG context injected).
+    expect(out).toBeUndefined();
+
+    // notify was called once with the EmbedError message at error level.
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    const [msg, level] = ctx.ui.notify.mock.calls[0];
+    expect(level).toBe("error");
+    expect(msg).toMatch(/\[rag\]/);
+    expect(msg).toMatch(/Authentication failed/);
+  });
 });
 
 // ─── getFreshDbConn: [Symbol.dispose] support ────────────────────────────────
@@ -1348,5 +1390,301 @@ describe("getFreshDbConn: [Symbol.dispose] for `using` declaration", () => {
     expect(typeof db.prepare).toBe("function");
     expect(typeof db.close).toBe("function");
     expect(typeof db.pragma).toBe("function");
+  });
+});
+
+// ─── initSchema edge cases ───────────────────────────────────────────────────
+
+describe("initSchema (db.ts)", () => {
+  let mod: typeof import("../index.ts");
+  let __resetProbeForTests: () => void = () => {};
+
+  beforeAll(async () => {
+    vi.resetModules();
+    mod = await import("../index.ts");
+    const embedMod = await import("../embed.ts");
+    __resetProbeForTests = embedMod.__resetProbeForTests;
+  });
+
+  beforeEach(() => {
+    __resetProbeForTests();
+  });
+
+  it("round-trips vector_dim through metadata after initSchema", () => {
+    const Database = require("better-sqlite3");
+    const { load: loadVec } = require("sqlite-vec");
+    const db = new Database(":memory:");
+    db.pragma("journal_mode = WAL");
+    loadVec(db);
+    mod.initSchema(db, 384);
+
+    const row = db.prepare("SELECT value FROM metadata WHERE key='vector_dim'").get() as { value?: string };
+    expect(row?.value).toBe("384");
+    db.close();
+  });
+
+  it("warns on dim mismatch but does NOT auto-drop chunks_vec", () => {
+    const Database = require("better-sqlite3");
+    const { load: loadVec } = require("sqlite-vec");
+    const db = new Database(":memory:");
+    db.pragma("journal_mode = WAL");
+    loadVec(db);
+    mod.initSchema(db, 384);   // stored=384
+
+    // Seed a populated chunks_vec so we can confirm it survives a re-init.
+    const insChunk = db.prepare(`
+      INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+      VALUES ('seed-1', '/seed.ts', 'x', 1, 1, 'h', '2026-01-01T00:00:00Z', 1)
+    `).run();
+    const vec = new Float32Array(384).fill(0.1);
+    db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
+      Number(insChunk.lastInsertRowid),
+      Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
+    );
+
+    // Capture stderr during initSchema with mismatched dim.
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      mod.initSchema(db, 768);
+      const calls = stderrSpy.mock.calls.map(c => String(c[0]));
+      const warned = calls.some(m => /vector dim mismatch: stored=384.*initializing with=768/.test(m));
+      expect(warned).toBe(true);
+
+      // chunks_vec still exists and still has the row we seeded.
+      const count = db.prepare("SELECT COUNT(*) as c FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE id='seed-1')").get() as { c: number };
+      expect(count.c).toBe(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    db.close();
+  });
+
+  it("propagates EmbedError from getVectorDim when no arg, no metadata, no env, no probe", () => {
+    const Database = require("better-sqlite3");
+    const { load: loadVec } = require("sqlite-vec");
+    const db = new Database(":memory:");
+    db.pragma("journal_mode = WAL");
+    loadVec(db);
+    mod.initSchema(db, 384);   // creates metadata so we have a known-good state
+
+    // Wipe any config/env that could resolve the dim, then clear the embed probe cache.
+    const savedCfg = { ...mod.loadConfig() };
+    const userCfg: typeof savedCfg = { ...savedCfg };
+    delete userCfg.embeddingDimensions;
+    mod.saveConfig(userCfg);
+    const savedDim = process.env.PI_RAG_EMBED_DIMENSIONS;
+    delete process.env.PI_RAG_EMBED_DIMENSIONS;
+    __resetProbeForTests();
+
+    try {
+      // initSchema on the open DB with no stored dim, no env, no probe →
+      // getVectorDim throws EmbedError("dim_mismatch", "Vector dim is unknown…").
+      db.prepare("DELETE FROM metadata WHERE key='vector_dim'").run();
+      expect(() => mod.initSchema(db)).toThrow(/Vector dim is unknown/);
+    } finally {
+      if (savedDim !== undefined) process.env.PI_RAG_EMBED_DIMENSIONS = savedDim;
+      mod.saveConfig(savedCfg);
+      db.close();
+    }
+  });
+});
+
+// ─── /rag clear command ─────────────────────────────────────────────────────
+
+describe("/rag clear command", () => {
+  let tmp: string;
+  let savedRagDir: string | undefined;
+  let savedEmbedDim: string | undefined;
+  let mod: typeof import("../index.ts");
+  let extensionFactory: typeof import("../index.ts").default;
+  let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+
+  function makePi() {
+    let hookFn: ((event: any, ctx: any) => Promise<any>) | undefined;
+    commandHandler = undefined;
+    return {
+      pi: {
+        on: (event: string, fn: any) => { if (event === "before_agent_start") hookFn = fn; },
+        registerCommand: (_name: string, config: any) => { commandHandler = config.handler; },
+        registerTool: () => {},
+        sendMessage: () => {},
+      },
+      fire: (event = { prompt: "hello", systemPrompt: "" }, ctx = {}) => hookFn!(event, ctx),
+    };
+  }
+
+  function seedIndex() {
+    const db = mod.getFreshDbConn();
+    try {
+      const r = db.prepare(`
+        INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+        VALUES ('c1', '/seed.ts', 'x', 1, 1, 'h', '2026-01-01T00:00:00Z', 1)
+      `).run();
+      const vec = new Float32Array(384).fill(0.1);
+      db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
+        Number(r.lastInsertRowid),
+        Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
+      );
+      db.prepare("INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("/seed.ts", "h", 1, "2026-01-01T00:00:00Z", 1, 1);
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run("2026-01-01T00:00:00Z");
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run("test-embed");
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('vector_dim', ?)").run("384");
+    } finally { db.close(); }
+  }
+
+  beforeAll(async () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "rag-clear-")));
+    savedRagDir = process.env.PI_RAG_DIR;
+    savedEmbedDim = process.env.PI_RAG_EMBED_DIMENSIONS;
+    process.env.PI_RAG_DIR = tmp;
+    process.env.PI_RAG_EMBED_DIMENSIONS = "384";
+    vi.resetModules();
+    mod = await import("../index.ts");
+    extensionFactory = mod.default;
+  });
+
+  beforeEach(() => {
+    mod.closeDbConn();
+    seedIndex();
+  });
+
+  afterAll(() => {
+    mod.closeDbConn();
+    rmSync(tmp, { recursive: true, force: true });
+    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
+    else delete process.env.PI_RAG_DIR;
+    if (savedEmbedDim !== undefined) process.env.PI_RAG_EMBED_DIMENSIONS = savedEmbedDim;
+    else delete process.env.PI_RAG_EMBED_DIMENSIONS;
+  });
+
+  it("wipes chunks, chunks_vec, files; preserves vector_dim; does NOT touch trackedPaths in config.json", async () => {
+    // Seed a tracked path in config that clear must not remove.
+    const cfg = mod.loadConfig();
+    cfg.trackedPaths = ["/some/tracked/path"];
+    mod.saveConfig(cfg);
+
+    const { pi } = makePi();
+    extensionFactory(pi as any);
+    expect(commandHandler).toBeDefined();
+
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } };
+    await commandHandler!("clear", ctx);
+
+    // Re-open the DB and assert state.
+    const db = mod.getFreshDbConn();
+    try {
+      expect(db.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number }).toEqual({ c: 0 });
+      expect(db.prepare("SELECT COUNT(*) as c FROM chunks_vec").get() as { c: number }).toEqual({ c: 0 });
+      expect(db.prepare("SELECT COUNT(*) as c FROM files").get() as { c: number }).toEqual({ c: 0 });
+
+      // vector_dim is preserved (so subsequent index doesn't have to re-probe).
+      const dimRow = db.prepare("SELECT value FROM metadata WHERE key='vector_dim'").get() as { value?: string };
+      expect(dimRow?.value).toBe("384");
+
+      // Other metadata rows are gone.
+      const lb = db.prepare("SELECT value FROM metadata WHERE key='last_build'").get();
+      expect(lb).toBeUndefined();
+      const em = db.prepare("SELECT value FROM metadata WHERE key='embedding_model'").get();
+      expect(em).toBeUndefined();
+    } finally { db.close(); }
+
+    // trackedPaths in config.json are preserved.
+    expect(mod.loadConfig().trackedPaths).toEqual(["/some/tracked/path"]);
+
+    // User-visible notification.
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/Tracked paths are preserved/), "info");
+  });
+});
+
+// ─── /rag rebuild --force dim change ─────────────────────────────────────────
+
+describe("/rag rebuild --force (dim change)", () => {
+  let tmp: string;
+  let savedRagDir: string | undefined;
+  let mod: typeof import("../index.ts");
+  let extensionFactory: typeof import("../index.ts").default;
+  let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+
+  function makePi() {
+    return {
+      pi: {
+        on: () => {},
+        registerCommand: (_name: string, config: any) => { commandHandler = config.handler; },
+        registerTool: () => {},
+        sendMessage: () => {},
+      },
+    };
+  }
+
+  beforeAll(async () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "rag-rebuild-")));
+    savedRagDir = process.env.PI_RAG_DIR;
+    process.env.PI_RAG_DIR = tmp;
+    process.env.PI_RAG_EMBED_DIMENSIONS = "384";
+    vi.resetModules();
+    mod = await import("../index.ts");
+    extensionFactory = mod.default;
+  });
+
+  afterAll(() => {
+    mod.closeDbConn();
+    rmSync(tmp, { recursive: true, force: true });
+    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
+    else delete process.env.PI_RAG_DIR;
+  });
+
+  it("drops chunks_vec and recreates it with the configured dim", async () => {
+    // Seed a populated chunks_vec at dim 384.
+    {
+      const db = mod.getFreshDbConn();
+      try {
+        const r = db.prepare(`
+          INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+          VALUES ('c1', '/seed.ts', 'x', 1, 1, 'h', '2026-01-01T00:00:00Z', 1)
+        `).run();
+        const vec = new Float32Array(384).fill(0.1);
+        db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
+          Number(r.lastInsertRowid),
+          Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
+        );
+        db.prepare("INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("/seed.ts", "h", 1, "2026-01-01T00:00:00Z", 1, 1);
+      } finally { db.close(); }
+    }
+
+    // Confirm starting state.
+    const before = mod.getFreshDbConn();
+    try {
+      expect((before.prepare("SELECT value FROM metadata WHERE key='vector_dim'").get() as { value: string }).value).toBe("384");
+      expect(before.prepare("SELECT COUNT(*) as c FROM chunks_vec").get() as { c: number }).toEqual({ c: 1 });
+    } finally { before.close(); }
+
+    // Now switch the configured dim to 768.
+    process.env.PI_RAG_EMBED_DIMENSIONS = "768";
+
+    // No files to re-embed in this test (no tracked paths), so the rebuild will
+    // wipe + drop + recreate chunks_vec but won't actually re-embed anything.
+    // We're specifically testing the schema migration, not the re-embed flow.
+
+    const { pi } = makePi();
+    extensionFactory(pi as any);
+    expect(commandHandler).toBeDefined();
+
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } };
+    await commandHandler!("rebuild --force", ctx);
+
+    // Confirm post-state.
+    const after = mod.getFreshDbConn();
+    try {
+      // vector_dim metadata reflects the new configured dim.
+      expect((after.prepare("SELECT value FROM metadata WHERE key='vector_dim'").get() as { value: string }).value).toBe("768");
+      // chunks_vec exists (re-created) but is empty (force wiped + no re-embed).
+      expect(after.prepare("SELECT COUNT(*) as c FROM chunks_vec").get() as { c: number }).toEqual({ c: 0 });
+      expect(after.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number }).toEqual({ c: 0 });
+      expect(after.prepare("SELECT COUNT(*) as c FROM files").get() as { c: number }).toEqual({ c: 0 });
+    } finally { after.close(); }
+
+    process.env.PI_RAG_EMBED_DIMENSIONS = "384";
   });
 });

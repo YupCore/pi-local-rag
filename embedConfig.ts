@@ -31,9 +31,11 @@ function envNum(name: string): number | undefined {
 export function resolveEmbedConfig(cfg: RagConfig): ResolvedEmbedConfig {
   const raw = envStr("PI_RAG_EMBED_BASE_URL")
     ?? (cfg.embeddingBaseUrl?.trim() || DEFAULT_BASE_URL);
-  // Strip trailing slashes, then append /v1. Works for "http://localhost:11434" and
-  // "http://localhost:11434/v1" (idempotent on the second case).
-  const baseUrl = raw.replace(/\/+$/, "") + "/v1";
+  // Strip trailing slashes, then append /v1 unless the URL already ends in it
+  // (so "http://x/v1" and "http://x/v1/" both produce "http://x/v1" instead of
+  // "http://x/v1/v1").
+  let baseUrl = raw.replace(/\/+$/, "");
+  if (!/\/v1$/i.test(baseUrl)) baseUrl = baseUrl + "/v1";
   return {
     baseUrl,
     model: envStr("PI_RAG_EMBED_MODEL")

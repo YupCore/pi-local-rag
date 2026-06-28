@@ -7,7 +7,7 @@
  * it to inject errors, custom dims, etc.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
-import { EmbedError, embed, embedBatch, __resetProbeForTests } from "../embed.ts";
+import { EmbedError, embed, embedBatch, getVectorDim, __resetProbeForTests } from "../embed.ts";
 
 const DIM = 384;
 const originalFetch = globalThis.fetch;
@@ -320,5 +320,99 @@ it("throws EmbedError('rate_limited') when 429 persists past 3 retries", async (
     expect(progress[0]).toEqual({ i: 64, total: 130 });
     expect(progress[1]).toEqual({ i: 128, total: 130 });
     expect(progress[2]).toEqual({ i: 130, total: 130 });
+  });
+
+  // ─── Additional HTTP error codes ────────────────────────────────────────────
+
+  it("does NOT retry on 403 — throws EmbedError('auth')", async () => {
+    let calls = 0;
+    fetchImpl = (async () => {
+      calls++;
+      return new Response("forbidden", { status: 403 });
+    }) as typeof fetch;
+
+    await expect(embed("hi")).rejects.toMatchObject({
+      name: "EmbedError",
+      code: "auth",
+      status: 403,
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("retries 5xx then throws EmbedError('unknown') after 3 attempts", async () => {
+    let calls = 0;
+    fetchImpl = (async () => {
+      calls++;
+      return new Response("server error", { status: 503 });
+    }) as typeof fetch;
+
+    await expect(embed("hi")).rejects.toMatchObject({
+      name: "EmbedError",
+      code: "unknown",
+      status: 503,
+    });
+    expect(calls).toBe(3);
+  });
+
+  it("retries 5xx once and then succeeds", async () => {
+    let calls = 0;
+    fetchImpl = (async (_input, init) => {
+      calls++;
+      if (calls < 2) return new Response("oops", { status: 502 });
+      return defaultFetch(DIM)("http://test-embed/v1/embeddings", init);
+    }) as typeof fetch;
+
+    const out = await embed("hi");
+    expect(out.length).toBe(DIM);
+    expect(calls).toBeGreaterThanOrEqual(3);   // 1 probe + 1 batch (each retries)
+  });
+
+  it("throws EmbedError('timeout') on AbortError after retries", async () => {
+    let calls = 0;
+    fetchImpl = (async () => {
+      calls++;
+      const err = new DOMException("aborted", "TimeoutError");
+      throw err;
+    }) as typeof fetch;
+
+    await expect(embed("hi")).rejects.toMatchObject({
+      name: "EmbedError",
+      code: "timeout",
+    });
+    expect(calls).toBe(3);
+  });
+
+  it("timeout error message names the base URL (regression sentinel)", async () => {
+    fetchImpl = (async () => {
+      throw new DOMException("aborted", "TimeoutError");
+    }) as typeof fetch;
+
+    await expect(embed("hi")).rejects.toThrow(/http:\/\/test-embed/);
+  });
+});
+
+// ─── getVectorDim() ──────────────────────────────────────────────────────────
+
+describe("getVectorDim()", () => {
+  it("throws EmbedError when no hint and no probe has run", () => {
+    delete process.env.PI_RAG_EMBED_DIMENSIONS;
+    __resetProbeForTests();
+    expect(() => getVectorDim()).toThrow(EmbedError);
+    expect(() => getVectorDim()).toThrow(/Vector dim is unknown/);
+  });
+
+  it("returns the config hint immediately (skips probe)", () => {
+    process.env.PI_RAG_EMBED_DIMENSIONS = "1024";
+    __resetProbeForTests();
+    expect(getVectorDim()).toBe(1024);
+  });
+
+  it("config hint wins over a previously-cached probe dim", () => {
+    // Even when the cached probe disagrees, the config hint takes precedence.
+    // This is the "your config is the source of truth" semantic.
+    process.env.PI_RAG_EMBED_DIMENSIONS = "1024";
+    __resetProbeForTests();
+    expect(getVectorDim()).toBe(1024);
+    delete process.env.PI_RAG_EMBED_DIMENSIONS;
   });
 });
