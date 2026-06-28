@@ -1,5 +1,4 @@
 // embed.ts — HTTP client for an OpenAI-compatible /v1/embeddings endpoint.
-// Replaces the old in-process @xenova/transformers ONNX pipeline.
 // Public surface (embed, embedBatch, BATCH_SIZE) is unchanged.
 
 import { loadConfig } from "./config.ts";

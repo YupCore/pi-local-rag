@@ -70,7 +70,7 @@ describe("embed (live HTTP)", () => {
     const finance = await embed("Quarterly revenue exceeded analyst expectations by twelve percent.");
     const simRelated = cosineSimilarity(cat, kitten);
     const simUnrelated = cosineSimilarity(cat, finance);
-    // Threshold lowered vs. the original All-MiniLM-L6-v2 test: model-agnostic.
+    // Model-agnostic thresholds: actual similarity depends on the configured backend.
     expect(simRelated).toBeGreaterThan(simUnrelated + 0.1);
     expect(simRelated).toBeGreaterThan(0.3);
   }, EMBED_TIMEOUT);

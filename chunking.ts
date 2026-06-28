@@ -102,8 +102,7 @@ export function collectFromTracked(cfg: RagConfig): string[] {
  * Async variant of collectFiles that uses fs.promises and yields to the event
  * loop between directories. Required for /rag rebuild on large trackedPaths
  * (45k+ files) — the synchronous walk pegs the event loop long enough that
- * the TUI freezes before reaching the embed phase. Adapted from
- * theli-ua/pi-local-rag@8432a15.
+ * the TUI freezes before reaching the embed phase.
  */
 export async function collectFilesAsync(
   dirPath: string,

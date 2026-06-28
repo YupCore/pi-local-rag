@@ -1,9 +1,6 @@
-import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-
-// Legacy lens→rag rename target. Overridable via env for tests.
-export const LEGACY_DIR = process.env.PI_RAG_LEGACY_DIR ?? join(homedir(), ".pi", "lens");
 
 /** Global fallback store. Lazily evaluated so tests can override $HOME. */
 export const GLOBAL_RAG_DIR = () => join(homedir(), ".pi", "rag");
@@ -42,28 +39,17 @@ export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
     mkdirSync(local, { recursive: true });
     return local;
   }
-  // Fallback: home-dir global. ensureDir handles creation + lens→rag migration.
+  // Fallback: home-dir global. ensureDir handles creation.
   const global = GLOBAL_RAG_DIR();
   ensureDir(global);
   return global;
 }
 
-/** SQLite database file (post-migration). */
+/** SQLite database file. */
 export function dbFile(ragDir: string): string { return join(ragDir, "rag.db"); }
-/** Legacy JSON index, kept for the one-shot auto-migration in getFreshDbConn. */
-export function legacyIndexFile(ragDir: string): string { return join(ragDir, "index.json"); }
-/** @deprecated use dbFile/legacyIndexFile. Kept temporarily for callers that still reach for the JSON path. */
-export function indexFile(ragDir: string): string { return join(ragDir, "index.json"); }
 export function configFile(ragDir: string): string { return join(ragDir, "config.json"); }
 
 export function ensureDir(ragDir: string) {
-  if (existsSync(ragDir)) return;
-  // Lens→rag migration only applies at the home-dir global store.
-  if (ragDir === GLOBAL_RAG_DIR() && existsSync(LEGACY_DIR)) {
-    try {
-      renameSync(LEGACY_DIR, ragDir);
-      return;
-    } catch { /* fall through to mkdir */ }
-  }
+  // `recursive: true` is idempotent — no need to existsSync-check first.
   mkdirSync(ragDir, { recursive: true });
 }

@@ -1,7 +1,6 @@
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
-import { getRagDir, dbFile, legacyIndexFile, ensureDir } from "./store.ts";
+import { getRagDir, dbFile, ensureDir } from "./store.ts";
 import { getVectorDim } from "./embed.ts";
 
 export interface Chunk {
@@ -31,13 +30,6 @@ interface FileEntry {
   indexed: string;
   size: number;
   embedded: boolean;
-}
-
-export interface IndexMeta {
-  chunks: Chunk[];
-  files: Record<string, FileEntry>;
-  lastBuild: string;
-  embeddingModel?: string;
 }
 
 export interface IndexStats {
@@ -79,15 +71,6 @@ export class RagDatabase {
     db.pragma("foreign_keys = ON");
     loadVec(db);
     initSchema(db, dim);
-
-    const legacyPath = legacyIndexFile(dir);
-    if (existsSync(legacyPath)) {
-      const chunkCount = db.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number };
-      if (chunkCount.c === 0) {
-        migrateFromJson(db, legacyPath, dim);
-      }
-    }
-
     return db;
   }
 
@@ -200,76 +183,6 @@ export function initSchema(db: Database.Database, dim?: number) {
   `);
 }
 
-function migrateFromJson(db: Database.Database, jsonPath: string, dim?: number): void {
-  let data: IndexMeta;
-  try {
-    data = JSON.parse(readFileSync(jsonPath, "utf-8"));
-  } catch { return; }
-
-  if (!data.chunks || data.chunks.length === 0) {
-    try { unlinkSync(jsonPath); } catch {}
-    return;
-  }
-
-  // Resolve the effective dim for legacy-vector length checks.
-  let effectiveDim: number = dim ?? -1;
-  if (dim === undefined) {
-    try {
-      const row = db.prepare("SELECT value FROM metadata WHERE key='vector_dim'").get() as { value?: string } | undefined;
-      const parsed = row?.value ? Number(row.value) : NaN;
-      if (Number.isFinite(parsed) && parsed > 0) effectiveDim = parsed;
-    } catch { /* metadata table may not exist yet; safe to ignore */ }
-  }
-  if (!Number.isFinite(effectiveDim) || effectiveDim < 1) {
-    // No dim available — skip all legacy vectors rather than corrupting chunks_vec
-    // with the wrong shape. The BM25 portion (chunks/chunks_fts/files) still migrates.
-    process.stderr.write(
-      `[rag] cannot resolve vector dim for legacy migration; ` +
-      `skipping ${data.chunks.length} legacy vectors. Re-index to populate.\n`,
-    );
-    effectiveDim = -1;
-  }
-
-  const tx = db.transaction(() => {
-    const insChunk = db.prepare(`
-      INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insVec = db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
-    const insFile = db.prepare(`
-      INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
-    let skipped = 0;
-    for (const c of data.chunks) {
-      const chunkResult = insChunk.run(c.id, c.file, c.content, c.lineStart, c.lineEnd, c.hash, c.indexed, c.tokens);
-      if (c.vector && effectiveDim > 0 && c.vector.length === effectiveDim) {
-        insVec.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(c.vector));
-      } else if (c.vector) {
-        skipped++;
-      }
-    }
-    if (skipped > 0) {
-      process.stderr.write(`[rag] skipped ${skipped} legacy vectors with wrong dim (expected ${effectiveDim}).\n`);
-    }
-
-    for (const [fp, info] of Object.entries(data.files || {})) {
-      insFile.run(fp, info.hash, info.chunks, info.indexed, info.size, info.embedded ? 1 : 0);
-    }
-
-    if (data.lastBuild) {
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(data.lastBuild);
-    }
-    if (data.embeddingModel) {
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(data.embeddingModel);
-    }
-  });
-
-  tx();
-  try { unlinkSync(jsonPath); } catch {}
-}
-
 export function float32ToBuffer(arr: number[]): Buffer {
   const f = new Float32Array(arr);
   return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
@@ -298,36 +211,6 @@ export function getIndexStats(db?: Database.Database): IndexStats {
     lastBuild: lastBuild?.value ?? "",
     embeddingModel: embeddingModel?.value ?? "",
     vectorDim: Number.isFinite(dim) && dim > 0 ? dim : 0,
-  };
-}
-
-/** No-op shim — JSON-era callers (and tests) compile against this. SQLite
- *  writes are committed by indexFiles' transactions; there is no separate
- *  save step. Kept on the public surface to avoid breaking external imports. */
-export function saveIndex(_index: IndexMeta) { /* writes are transactional in indexFiles */ }
-
-export function loadIndex(): IndexMeta {
-  const db = getDbConn();
-  const chunks = db.prepare(`
-    SELECT c.id, c.file_path as file, c.chunk_content as content,
-            c.line_start as lineStart, c.line_end as lineEnd,
-            c.chunk_hash as hash, c.indexed_at as indexed, c.tokens
-    FROM chunks c
-  `).all() as Chunk[];
-
-  const filesRaw = db.prepare("SELECT * FROM files").all() as Array<FileDbEntry>;
-  const files: IndexMeta["files"] = {};
-  for (const f of filesRaw) {
-    files[f.path] = {hash: f.hash, chunks: f.chunks, indexed: f.indexed, size: f.size, embedded: !!f.embedded};
-  }
-
-  const lastBuild = db.prepare("SELECT value FROM metadata WHERE key = 'last_build'").get() as { value?: string } | undefined;
-  const embeddingModel = db.prepare("SELECT value FROM metadata WHERE key = 'embedding_model'").get() as { value?: string } | undefined;
-
-  return {
-    chunks, files,
-    lastBuild: lastBuild?.value ?? "",
-    embeddingModel: embeddingModel?.value,
   };
 }
 

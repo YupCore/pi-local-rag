@@ -194,8 +194,6 @@ Index data lives in `rag.db` (SQLite, WAL mode, with FTS5 + sqlite-vec extension
 
 `/rag index <path>` creates a project store at the current cwd if no parent store is in scope. `/rag status` shows the resolved path and whether it's project-local or global.
 
-Legacy `~/.pi/lens/` directories are renamed to `~/.pi/rag/` on first run; legacy `index.json` files are migrated into `rag.db` and removed.
-
 ## Configuration
 
 Auto-injection is on by default. Config lives in `<ragDir>/config.json`:

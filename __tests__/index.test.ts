@@ -1,9 +1,7 @@
 /**
  * Combined test suite for pi-local-rag.
  *
- * Layout mirrors upstream forks (theli-ua, kallewoof) so future fork-sync work
- * can be ported in unchanged. Each top-level `describe(...)` groups tests for
- * one area of the module.
+ * Each top-level `describe(...)` groups tests for one area of the module.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from "vitest";
 import {
@@ -67,7 +65,7 @@ beforeAll(() => {
   process.env.PI_RAG_EMBED_BASE_URL = "http://test-embed";
   process.env.PI_RAG_EMBED_MODEL = "test-embed";
   process.env.PI_RAG_EMBED_API_KEY = "";
-  // Tests use the same 384-dim schema as the old ONNX default.
+  // Tests use a 384-dim schema (matches the default test fixture).
   process.env.PI_RAG_EMBED_DIMENSIONS = "384";
 });
 
@@ -108,7 +106,7 @@ import {
 
 /** Create an in-memory SQLite DB with the RAG schema, pre-populated with chunks.
  *  Used by hybridSearch tests — avoids the per-file rag.db write overhead and
- *  isolates each test. Pulled verbatim from kallewoof@849e485 tests. */
+ *  isolates each test. */
 function createTestDb(chunks: Array<{
   id?: string; file?: string; content: string; lineStart?: number; lineEnd?: number;
   vector?: number[];
@@ -344,7 +342,7 @@ describe("collectFiles", () => {
     writeFileSync(join(tmp, "src", "deep.py"), "print('hi')");
     writeFileSync(join(tmp, "huge.ts"), "x".repeat(500_001));
 
-    const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
+    const files = collectFiles(tmp).map(f => f.replace(tmp, "").replaceAll("\\", "/")).sort();
     expect(files).toContain("/a.ts");
     expect(files).toContain("/b.md");
     expect(files).toContain("/src/deep.py");
@@ -375,7 +373,7 @@ describe("collectFiles", () => {
     writeFileSync(join(tmp, "doc.pdf"), Buffer.from("%PDF-1.4 stub"));
     writeFileSync(join(tmp, "doc.docx"), Buffer.from("PK\x03\x04 stub"));
     writeFileSync(join(tmp, "a.ts"), "x");
-    const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
+    const files = collectFiles(tmp).map(f => f.replace(tmp, "").replaceAll("\\", "/")).sort();
     expect(files).toContain("/doc.pdf");
     expect(files).toContain("/doc.docx");
     expect(files).toContain("/a.ts");
@@ -384,7 +382,7 @@ describe("collectFiles", () => {
   it("9 MB PDF accepted, 500 KB text rejected", () => {
     writeFileSync(join(tmp, "big.pdf"), Buffer.alloc(9_000_000));
     writeFileSync(join(tmp, "big.txt"), "x".repeat(500_000));
-    const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
+    const files = collectFiles(tmp).map(f => f.replace(tmp, "").replaceAll("\\", "/")).sort();
     expect(files).toContain("/big.pdf");
     expect(files.some(f => f.endsWith("big.txt"))).toBe(false);
   });
@@ -405,7 +403,7 @@ describe("collectFiles", () => {
   it("excludePatterns filters a top-level file", () => {
     writeFileSync(join(tmp, "a.ts"), "x");
     writeFileSync(join(tmp, "b.ts"), "x");
-    const files = collectFiles(tmp, undefined, ["b.ts"]).map(f => f.replace(tmp, ""));
+    const files = collectFiles(tmp, undefined, ["b.ts"]).map(f => f.replace(tmp, "").replaceAll("\\", "/"));
     expect(files).not.toContain("/b.ts");
     expect(files).toContain("/a.ts");
   });
@@ -414,7 +412,7 @@ describe("collectFiles", () => {
     writeFileSync(join(tmp, "a.ts"), "x");
     mkdirSync(join(tmp, "gen"));
     writeFileSync(join(tmp, "gen", "ignored.ts"), "x");
-    const files = collectFiles(tmp, undefined, ["gen/"]).map(f => f.replace(tmp, ""));
+    const files = collectFiles(tmp, undefined, ["gen/"]).map(f => f.replace(tmp, "").replaceAll("\\", "/"));
     expect(files.some(f => f.includes("/gen/"))).toBe(false);
     expect(files).toContain("/a.ts");
   });
@@ -422,7 +420,7 @@ describe("collectFiles", () => {
   it("extension glob exclude", () => {
     writeFileSync(join(tmp, "page.html"), "<p>x</p>");
     writeFileSync(join(tmp, "a.ts"), "x");
-    const files = collectFiles(tmp, undefined, ["*.html"]).map(f => f.replace(tmp, ""));
+    const files = collectFiles(tmp, undefined, ["*.html"]).map(f => f.replace(tmp, "").replaceAll("\\", "/"));
     expect(files.some(f => f.endsWith(".html"))).toBe(false);
     expect(files.some(f => f.endsWith(".ts"))).toBe(true);
   });
@@ -521,7 +519,7 @@ describe("collectFilesAsync", () => {
       writeFileSync(join(root, "src", "deep.py"), "x");
 
       const { collectFilesAsync } = await import("../index.ts");
-      const files = (await collectFilesAsync(root)).map(f => f.replace(root, "")).sort();
+      const files = (await collectFilesAsync(root)).map(f => f.replace(root, "").replaceAll("\\", "/")).sort();
       expect(files).toContain("/a.ts");
       expect(files).toContain("/b.md");
       expect(files).toContain("/src/deep.py");
@@ -538,7 +536,7 @@ describe("collectFilesAsync", () => {
       writeFileSync(join(root, "page.html"), "<p>x</p>");
       writeFileSync(join(root, "a.ts"), "x");
       const { collectFilesAsync } = await import("../index.ts");
-      const files = (await collectFilesAsync(root, undefined, ["*.html"])).map(f => f.replace(root, ""));
+      const files = (await collectFilesAsync(root, undefined, ["*.html"])).map(f => f.replace(root, "").replaceAll("\\", "/"));
       expect(files.some(f => f.endsWith(".html"))).toBe(false);
       expect(files.some(f => f.endsWith(".ts"))).toBe(true);
     } finally {
@@ -585,7 +583,7 @@ describe("indexFiles --force", () => {
       expect(r2.indexed).toBe(0);
 
       // Third pass with force=true: re-embeds the file even though the hash
-      // hasn't changed (commit 8432a15 / theli-ua).
+      // hasn't changed.
       const r3 = await mod.indexFiles([fp], undefined, undefined, true);
       expect(r3.indexed).toBe(1);
       expect(r3.skipped).toBe(0);
@@ -768,7 +766,6 @@ describe("extractText HTML", () => {
 });
 
 // ─── OCR fallback ────────────────────────────────────────────────────────────
-// Tests ported verbatim from kallewoof@a5e2b96.
 
 describe("isSparsePdfText", () => {
   it("empty text → sparse", () => {
@@ -820,7 +817,7 @@ describe.skipIf(!ocrTools.available)("OCR end-to-end", () => {
 });
 
 // ─── hybridSearch (FTS5 BM25 + sqlite-vec) ──────────────────────────────────
-// Tests ported from kallewoof@849e485 — populate an in-memory DB via
+// Populate an in-memory DB via
 // createTestDb() and pass it to hybridSearch's optional _db arg.
 
 describe("hybridSearch (BM25 via FTS5, no vectors)", () => {
@@ -985,40 +982,32 @@ describe("/rag find glob matching", () => {
 // that file deliberately doesn't stub globalThis.fetch, matching the
 // fork's split between index.test.ts (mocked) and embedding.live.test.ts (real).)
 
-// ─── Storage: loadConfig / saveConfig / loadIndex / saveIndex / ensureDir ───
+// ─── Storage: loadConfig / saveConfig / ensureDir ───────────────────────────
 //
-// These tests mutate process.env.PI_RAG_DIR / PI_RAG_LEGACY_DIR before
-// importing index.ts, which means they need a fresh module instance (the
-// env vars are read into module-top-level `const`s). `vi.resetModules()`
-// invalidates the cached graph so the dynamic import re-evaluates.
+// These tests mutate process.env.PI_RAG_DIR before importing index.ts, which
+// means they need a fresh module instance (the env vars are read into
+// module-top-level `const`s). `vi.resetModules()` invalidates the cached
+// graph so the dynamic import re-evaluates.
 
-describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => {
+describe("Storage (loadConfig / saveConfig)", () => {
   let ragDir: string;
-  let legacyDir: string;
   // Bound at beforeAll-time via fresh module import.
   let loadConfig: typeof import("../index.ts").loadConfig;
   let saveConfig: typeof import("../index.ts").saveConfig;
-  let loadIndex: typeof import("../index.ts").loadIndex;
-  let saveIndex: typeof import("../index.ts").saveIndex;
 
   beforeAll(async () => {
     ragDir = mkdtempSync(join(tmpdir(), "pi-rag-storage-"));
-    legacyDir = mkdtempSync(join(tmpdir(), "pi-lens-legacy-"));
     process.env.PI_RAG_DIR = ragDir;
-    process.env.PI_RAG_LEGACY_DIR = legacyDir;
     rmSync(ragDir, { recursive: true, force: true });
-    rmSync(legacyDir, { recursive: true, force: true });
 
     vi.resetModules();
     const mod = await import("../index.ts");
-    ({ loadConfig, saveConfig, loadIndex, saveIndex } = mod);
+    ({ loadConfig, saveConfig } = mod);
   });
 
   afterAll(() => {
     rmSync(ragDir, { recursive: true, force: true });
-    rmSync(legacyDir, { recursive: true, force: true });
     delete process.env.PI_RAG_DIR;
-    delete process.env.PI_RAG_LEGACY_DIR;
   });
 
   it("loadConfig: returns defaults when no config file exists", () => {
@@ -1066,60 +1055,6 @@ describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => 
     expect(cfg.ragEnabled).toBe(true);
     expect(cfg.ragTopK).toBe(5);
   });
-
-  it("loadIndex: empty/missing index returns an empty IndexMeta shell", () => {
-    rmSync(join(ragDir, "index.json"), { force: true });
-    const idx = loadIndex();
-    expect(idx.chunks).toEqual([]);
-    expect(idx.files).toEqual({});
-    expect(idx.lastBuild).toBe("");
-  });
-
-  it("loadIndex: reconstructs IndexMeta from chunks + files + metadata in the DB", async () => {
-    // Insert directly via a fresh (non-singleton) connection, then read back
-    // through loadIndex. saveIndex is now a no-op (writes are transactional
-    // in indexFiles); loadIndex hydrates the legacy IndexMeta shape from SQLite.
-    const mod = await import("../index.ts");
-    const db = mod.getFreshDbConn();
-    try {
-      const r = db.prepare(`
-        INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run("abc-1", "/some/file.ts", "export const x = 1;", 1, 1, "deadbeef", "2026-05-15T00:00:00Z", 6);
-      const vec = new Float32Array(384).fill(0.1);
-      db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
-        Number(r.lastInsertRowid),
-        Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
-      );
-      db.prepare(`
-        INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run("/some/file.ts", "deadbeef", 1, "2026-05-15T00:00:00Z", 19, 1);
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run("2026-05-15T00:00:00Z");
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run("test-embed");
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('vector_dim', ?)").run("384");
-    } finally {
-      db.close();
-    }
-
-    const read = mod.loadIndex();
-    expect(read.lastBuild).toBe("2026-05-15T00:00:00Z");
-    expect(read.embeddingModel).toBe("test-embed");
-    expect(read.chunks).toHaveLength(1);
-    expect(read.chunks[0].id).toBe("abc-1");
-    expect(read.chunks[0].file).toBe("/some/file.ts");
-    expect(read.chunks[0].content).toBe("export const x = 1;");
-    expect(read.files["/some/file.ts"]).toEqual({
-      hash: "deadbeef", chunks: 1, indexed: "2026-05-15T00:00:00Z", size: 19, embedded: true,
-    });
-  });
-
-  it("saveIndex is a no-op (writes happen via indexFiles transactions)", () => {
-    // Documented behavior — saveIndex used to write index.json. Under SQLite,
-    // chunk + file writes are committed by indexFiles. The export exists for
-    // back-compat with callers that still call it.
-    expect(() => saveIndex({ chunks: [], files: {}, lastBuild: "" })).not.toThrow();
-  });
 });
 
 // ─── getRagDir: walk-up resolution + project vs global store ────────────────
@@ -1129,6 +1064,7 @@ describe("getRagDir (per-project store resolution)", () => {
   let projectRoot: string;
   let savedCwd: string;
   let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
   let savedRagDir: string | undefined;
   let getRagDir: typeof import("../index.ts").getRagDir;
   let GLOBAL_RAG_DIR: typeof import("../index.ts").GLOBAL_RAG_DIR;
@@ -1143,8 +1079,10 @@ describe("getRagDir (per-project store resolution)", () => {
     projectRoot = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-proj-")));
     savedCwd = process.cwd();
     savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
     savedRagDir = process.env.PI_RAG_DIR;
     process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;   // os.homedir() on Windows reads USERPROFILE, not HOME
     delete process.env.PI_RAG_DIR;
 
     vi.resetModules();
@@ -1156,6 +1094,7 @@ describe("getRagDir (per-project store resolution)", () => {
     rmSync(fakeHome, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
     if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+    if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile; else delete process.env.USERPROFILE;
     if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
   });
 
@@ -1185,105 +1124,36 @@ describe("getRagDir (per-project store resolution)", () => {
   });
 
   it("falls back to the global ~/.pi/rag when no project store is in scope", () => {
-    const isolated = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-iso-")));
+    // Anchor the test cwd inside fakeHome so walk-up actually reaches home
+    // (otherwise it walks past tmpdir() and discovers the developer's real
+    // ~/.pi/rag on Windows).
+    const isolated = resolveTmp(mkdtempSync(join(fakeHome, "iso-")));
     try {
       process.chdir(isolated);
       const got = getRagDir();
       expect(got).toBe(GLOBAL_RAG_DIR());
       expect(got.startsWith(fakeHome)).toBe(true);
     } finally {
+      process.chdir(savedCwd);   // Windows refuses rmSync of the cwd
       rmSync(isolated, { recursive: true, force: true });
     }
   });
 
   it("createIfMissing: anchors a new project store at cwd", () => {
-    const fresh = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-fresh-")));
+    const fresh = resolveTmp(mkdtempSync(join(fakeHome, "fresh-")));
     try {
       process.chdir(fresh);
       const got = getRagDir({ createIfMissing: true });
       expect(got).toBe(join(fresh, ".pi", "rag"));
       expect(existsSync(got)).toBe(true);
     } finally {
+      process.chdir(savedCwd);   // Windows refuses rmSync of the cwd
       rmSync(fresh, { recursive: true, force: true });
     }
   });
 });
 
-// The legacy ~/.pi/lens → ~/.pi/rag migration now only fires when the
-// home-dir global store is in play (PI_RAG_DIR override skips it). To
-// exercise it we have to fake HOME rather than use PI_RAG_DIR.
-describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store only)", () => {
-  let fakeHome: string;
-  let cwdSandbox: string;
-  let savedCwd: string;
-  let savedHome: string | undefined;
-  let savedRagDir: string | undefined;
-  let savedLegacyDir: string | undefined;
-  let loadIndex: typeof import("../index.ts").loadIndex;
-
-  beforeAll(async () => {
-    fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "pi-rag-home-")));
-    // chdir to an isolated path so walk-up doesn't discover the real user's
-    // ~/.pi/rag (which exists outside our fake HOME).
-    cwdSandbox = realpathSync(mkdtempSync(join(tmpdir(), "pi-rag-cwd-")));
-    savedCwd = process.cwd();
-    savedHome = process.env.HOME;
-    savedRagDir = process.env.PI_RAG_DIR;
-    savedLegacyDir = process.env.PI_RAG_LEGACY_DIR;
-    process.env.HOME = fakeHome;
-    delete process.env.PI_RAG_DIR;
-    delete process.env.PI_RAG_LEGACY_DIR;
-    process.chdir(cwdSandbox);
-
-    // Populate the legacy dir at the fake home so migration has work to do.
-    // Under SQLite this exercises two migration paths in sequence:
-    //   1. ensureDir() renames ~/.pi/lens → ~/.pi/rag (dir rename)
-    //   2. getFreshDbConn() spots the moved index.json inside ~/.pi/rag and imports
-    //      its contents into rag.db, then unlinks the JSON file.
-    // migrateFromJson skips the import when chunks.length === 0, so the
-    // fixture has at least one chunk so we can observe the round-trip.
-    const legacy = join(fakeHome, ".pi", "lens");
-    mkdirSync(legacy, { recursive: true });
-    writeFileSync(join(legacy, "index.json"), JSON.stringify({
-      chunks: [{
-        id: "legacy-1",
-        file: "/legacy/file.ts",
-        content: "from-legacy-payload",
-        lineStart: 1, lineEnd: 1,
-        hash: "abc",
-        indexed: "2026-05-01T00:00:00Z",
-        tokens: 5,
-      }],
-      files: {},
-      lastBuild: "from-legacy",
-    }));
-
-    vi.resetModules();
-    ({ loadIndex } = await import("../index.ts"));
-  });
-
-  afterAll(() => {
-    process.chdir(savedCwd);
-    rmSync(fakeHome, { recursive: true, force: true });
-    rmSync(cwdSandbox, { recursive: true, force: true });
-    if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
-    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
-    if (savedLegacyDir !== undefined) process.env.PI_RAG_LEGACY_DIR = savedLegacyDir;
-  });
-
-  it("renames ~/.pi/lens → ~/.pi/rag, imports legacy index.json into rag.db, then deletes the JSON", () => {
-    const idx = loadIndex();
-    expect(idx.lastBuild).toBe("from-legacy");
-    expect(idx.chunks).toHaveLength(1);
-    expect(idx.chunks[0].content).toBe("from-legacy-payload");
-    expect(existsSync(join(fakeHome, ".pi", "rag"))).toBe(true);
-    expect(existsSync(join(fakeHome, ".pi", "lens"))).toBe(false);
-    // index.json should have been consumed by getFreshDbConn's auto-migration.
-    expect(existsSync(join(fakeHome, ".pi", "rag", "index.json"))).toBe(false);
-    // The DB itself should exist now.
-    expect(existsSync(join(fakeHome, ".pi", "rag", "rag.db"))).toBe(true);
-  });
-});
+// ─── isIndexStale ───────────────────────────────────────────────────────────
 
 // ─── isIndexStale ───────────────────────────────────────────────────────────
 
@@ -1315,10 +1185,10 @@ describe("isIndexStale", () => {
 
 // ─── before_agent_start auto-refresh ────────────────────────────────────────
 //
-// Exercises the 24h auto-refresh path. Uses vi.doMock to swap the embedder for
-// a fast stub (the real ONNX model is ~23 MB and slow to load). PI_RAG_DIR
-// pins storage to a throwaway dir so the hook can mutate the on-disk index
-// without touching the developer's real ~/.pi/rag.
+// Exercises the 24h auto-refresh path. The fetch stub in beforeAll above
+// returns immediately, so the embed step is fast. PI_RAG_DIR pins storage to
+// a throwaway dir so the hook can mutate the on-disk index without touching
+// the developer's real ~/.pi/rag.
 
 describe("before_agent_start: 24h auto-refresh", () => {
   const DAY_MS = 24 * 60 * 60 * 1000;

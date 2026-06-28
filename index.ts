@@ -27,12 +27,12 @@
  *
  * Implementation is split across:
  *   constants.ts     — shared constants, file ext sets, size limits
- *   store.ts         — RAG_DIR / LEGACY_DIR / file paths / ensureDir + legacy migration
+ *   store.ts         — rag dir resolution, ensureDir, file path helpers
  *   config.ts        — RagConfig type, loadConfig / saveConfig, ext helpers
- *   index-store.ts   — Chunk / IndexMeta types, loadIndex / saveIndex (JSON)
+ *   embedConfig.ts   — resolveEmbedConfig: merges env + config + defaults
  *   chunking.ts      — sha256, chunkText, collectFiles, extractText (txt/pdf/docx/html)
  *   embed.ts         — embed, embedBatch (HTTP client for /v1/embeddings)
- *   embedConfig.ts   — resolveEmbedConfig: merges env + config + defaults
+ *   db.ts            — RagDatabase singleton, initSchema, getIndexStats, float32ToBuffer
  *   search.ts        — cosineSimilarity, normalize, hybridSearch
  *   indexing.ts      — indexFiles (parallel Phase 1 read, sequential Phase 2 embed)
  *   index.ts         — extension entry point (this file) + re-exports
@@ -47,7 +47,7 @@ import ignore from "ignore";
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, saveIndex, getIndexStats } from "./db.ts";
+import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch, type ScoredChunk } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
@@ -56,11 +56,11 @@ import { EmbedError } from "./embed.ts";
 // Re-export the public surface so existing consumers of `pi-local-rag` keep
 // working (tests, downstream code that imports from the package root).
 export { DEFAULT_TEXT_EXTS } from "./constants.ts";
-export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
+export { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
-export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
-export { getFreshDbConn, getDbConn, closeDbConn, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
+export type { Chunk, IndexStats } from "./db.ts";
+export { getFreshDbConn, getDbConn, closeDbConn, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
 export {
   sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
   isExcludedByConfig, extractText, getOcrTooling, isSparsePdfText,
@@ -75,8 +75,7 @@ export type { ProgressCallbacks } from "./indexing.ts";
 
 export default function (pi: ExtensionAPI) {
   // Throttle stale-index checks to once per hour so we don't repeatedly stat
-  // the filesystem on every agent turn (matches the upstream fork's
-  // lastStaleCheckMs pattern from kallewoof@849e485).
+  // the filesystem on every agent turn.
   let lastStaleCheckMs = 0;
   const STALE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -492,8 +491,18 @@ export default function (pi: ExtensionAPI) {
 
       // ── clear ──
       if (cmd === "clear") {
-        saveIndex({ chunks: [], files: {}, lastBuild: "" });
-        ctx.ui.notify("Index cleared.", "info");
+        const database = getDbConn();
+        const tx = database.transaction(() => {
+          database.exec(
+            "DELETE FROM chunks_vec; " +
+            "DELETE FROM chunks; " +
+            "DELETE FROM files; " +
+            "DELETE FROM metadata WHERE key != 'vector_dim';",
+          );
+        });
+        tx();
+        process.stderr.write(`\r\x1b[2K`);
+        ctx.ui.notify("Cleared index. Tracked paths are preserved.", "info");
         return;
       }
 
