@@ -8,6 +8,7 @@ export interface ResolvedEmbedConfig {
   apiKey: string;
   dimensions?: number;      // optional; probe fills this in if undefined
   concurrency?: number;     // concurrent /v1/embeddings requests during indexing
+  batchSize?: number;       // inputs per HTTP call (default 64)
 }
 
 const DEFAULT_BASE_URL = "http://localhost:8080";
@@ -45,5 +46,6 @@ export function resolveEmbedConfig(cfg: RagConfig): ResolvedEmbedConfig {
       ?? (cfg.embeddingApiKey?.trim() || ""),
     dimensions: envNum("PI_RAG_EMBED_DIMENSIONS") ?? cfg.embeddingDimensions,
     concurrency: envNum("PI_RAG_EMBED_CONCURRENCY") ?? cfg.embeddingConcurrency,
+    batchSize: envNum("PI_RAG_EMBED_BATCH_SIZE") ?? cfg.embeddingBatchSize,
   };
 }

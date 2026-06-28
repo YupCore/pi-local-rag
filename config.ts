@@ -19,6 +19,7 @@ export interface RagConfig {
   embeddingApiKey?: string;
   embeddingDimensions?: number;
   embeddingConcurrency?: number;   // concurrent /v1/embeddings requests during indexing (default 3)
+  embeddingBatchSize?: number;     // inputs per /v1/embeddings call (default 64; lower for tight ctx)
 }
 
 export function defaultConfig(): RagConfig {

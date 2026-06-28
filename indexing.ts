@@ -35,7 +35,7 @@ interface FileWork {
   fp: string;
   hash: string;
   size: number;
-  rawChunks: { content: string; lineStart: number; lineEnd: number; hash: string }[];
+  rawChunks: { content: string; lineStart: number; lineEnd: number; hash: string; part: number }[];
   _vectors?: number[][];
 }
 
@@ -64,7 +64,7 @@ export async function indexFiles(
     const CONCURRENCY = 32;
     const YIELD_INTERVAL = 64;
 
-    interface ReadResult { fp: string; hash: string; size: number; raw: { content: string; lineStart: number; lineEnd: number }[] }
+    interface ReadResult { fp: string; hash: string; size: number; raw: { content: string; lineStart: number; lineEnd: number; part: number }[] }
 
     const readQueue: ReadResult[] = [];
     let readQueueDone = false;
@@ -142,12 +142,13 @@ export async function indexFiles(
     skipped += readErrorCount;
 
     // Phase 2: embed in cross-file groups with bounded concurrency.
-    // Each group is one HTTP POST with up to BATCH_SIZE inputs. Multiple groups
-    // fly in parallel — the wall-time win scales with EMBED_CONCURRENCY up to
-    // the server's actual throughput. 3 is a safe ceiling for a single-process
-    // llama.cpp server; raise for hosted endpoints (OpenAI handles 10+ easily).
-    const EMBED_GROUP_TARGET = 64;
+    // Each group is one HTTP POST with up to batchSize inputs (from config or
+    // the embed.ts default). Multiple groups fly in parallel — the wall-time
+    // win scales with EMBED_CONCURRENCY up to the server's throughput.
+    // 3 is a safe ceiling for a single-process llama.cpp server; raise for
+    // hosted endpoints (OpenAI handles 10+ easily).
     const resolvedCfg = resolveEmbedConfig(loadConfig());
+    const EMBED_GROUP_TARGET = resolvedCfg.batchSize ?? 64;
     const EMBED_CONCURRENCY = resolvedCfg.concurrency ?? 3;
 
     interface GroupJob {
@@ -219,11 +220,13 @@ export async function indexFiles(
       for (const fw of toIndex) {
         const vectors = fw._vectors;
         // Hash the file path once per file — every chunk id embeds it.
+        // part disambiguates within a file (continuation chunks of a single
+        // oversized line share lineStart but need unique ids).
         const fpHash = sha256(fw.fp);
         for (let j = 0; j < fw.rawChunks.length; j++) {
           const c = fw.rawChunks[j];
           const chunkResult = insChunk.run(
-            `${fpHash}-${c.lineStart}`,
+            `${fpHash}-${c.lineStart}-${c.part}`,
             fw.fp, c.content, c.lineStart, c.lineEnd, c.hash,
             indexedAt,
             Math.ceil(c.content.length / 4),

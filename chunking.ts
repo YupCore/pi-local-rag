@@ -15,20 +15,101 @@ export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
 }
 
-export function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
+/** Hard cap on chunk char count. Markdown with code blocks/tables tokenizes
+ *  denser than prose (~2.5 chars/token vs ~4). With this cap:
+ *   - worst case ~1600 tokens per chunk
+ *   - batch=4 → ~6400 tokens per request (room under 8k llama.cpp ctx)
+ *   - hosted endpoints with larger ctx can crank batch up via config */
+const MAX_CHUNK_CHARS = 4_000;
+
+export interface TextChunk {
+  content: string;
+  lineStart: number;
+  lineEnd: number;
+  /** Split index within the source line, when a single line was too big and
+   *  was character-split into multiple chunks (otherwise 0). Used to make
+   *  chunk IDs unique across the splits. */
+  part: number;
+}
+
+export function chunkText(text: string, maxLines = 50): TextChunk[] {
   const lines = text.split("\n");
-  const chunks: { content: string; lineStart: number; lineEnd: number }[] = [];
+  const chunks: TextChunk[] = [];
   let i = 0;
   while (i < lines.length) {
     let end = Math.min(i + maxLines, lines.length);
+    // Prefer splitting at a blank line near the end for natural break.
     for (let j = end - 1; j > i + 10 && j > end - 15; j--) {
       if (lines[j]?.trim() === "") { end = j + 1; break; }
     }
-    const chunk = lines.slice(i, end).join("\n");
-    if (chunk.trim().length > 20) {
-      chunks.push({ content: chunk, lineStart: i + 1, lineEnd: end });
+
+    // Sub-chunk if the candidate slice still exceeds MAX_CHUNK_CHARS — split
+    // at blank lines, then truncate by line, then hard-truncate.
+    while (i < end) {
+      const slice = lines.slice(i, end);
+      const joined = slice.join("\n");
+      if (joined.length <= MAX_CHUNK_CHARS) {
+        if (joined.trim().length > 20) {
+          chunks.push({ content: joined, lineStart: i + 1, lineEnd: end, part: 0 });
+        }
+        i = end;
+        break;
+      }
+      // Find a blank line within the slice to split at (closer to middle is fine).
+      let splitAt = -1;
+      for (let k = end - 1; k > i + 1; k--) {
+        if (lines[k]?.trim() === "") { splitAt = k; break; }
+      }
+      if (splitAt > 0) {
+        const head = lines.slice(i, splitAt).join("\n");
+        // If the natural break still blows the cap (e.g. a single section with
+        // long bullet lists and no internal blank lines), fall through to path
+        // 3 which walks forward accumulating and is guaranteed to stay ≤ cap.
+        if (head.length <= MAX_CHUNK_CHARS) {
+          if (head.trim().length > 20) {
+            chunks.push({ content: head, lineStart: i + 1, lineEnd: splitAt, part: 0 });
+          }
+          i = splitAt + 1;
+          continue;
+        }
+      }
+      // No blank-line split possible — walk forward accumulating until
+      // adding the next line would push past the cap, then commit.
+      let cut = i + 1;
+      let acc = lines[i] ?? "";
+      // Single oversized line (e.g. minified JSON on one line in a docs page)
+      // — hard-split into MAX_CHUNK_CHARS-sized pieces with continuation markers.
+      if (acc.length > MAX_CHUNK_CHARS) {
+        let off = 0;
+        let part = 0;
+        const total = Math.ceil(acc.length / MAX_CHUNK_CHARS);
+        while (off < acc.length) {
+          const prefix = part > 0 ? `[chunk ${part + 1}/${total} cont.] ` : "";
+          // Reserve a few extra chars for the suffix so we never overflow.
+          const room = MAX_CHUNK_CHARS - prefix.length - 8;
+          const slice = acc.slice(off, off + Math.max(1, room));
+          const continuation = off + slice.length < acc.length ? " [...]" : "";
+          const labeled = prefix + slice + continuation;
+          if (labeled.trim().length > 20) {
+            chunks.push({ content: labeled, lineStart: i + 1, lineEnd: i + 1, part });
+          }
+          off += slice.length;
+          part++;
+        }
+        i = cut;
+        continue;
+      }
+      for (let k = i + 1; k < end; k++) {
+        const next = acc + "\n" + lines[k];
+        if (next.length > MAX_CHUNK_CHARS) break;
+        acc = next;
+        cut = k + 1;
+      }
+      if (acc.trim().length > 20) {
+        chunks.push({ content: acc, lineStart: i + 1, lineEnd: cut, part: 0 });
+      }
+      i = cut;
     }
-    i = end;
   }
   return chunks;
 }

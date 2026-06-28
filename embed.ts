@@ -5,7 +5,10 @@ import { createHash } from "node:crypto";
 import { loadConfig } from "./config.ts";
 import { resolveEmbedConfig } from "./embedConfig.ts";
 
-/** Default batch size for a single /v1/embeddings HTTP call. */
+/** Default batch size for a single /v1/embeddings HTTP call. Override per
+ *  session via config.embeddingBatchSize / PI_RAG_EMBED_BATCH_SIZE — needed
+ *  for short-context embedding servers (e.g. local llama.cpp at n_ctx=8192)
+ *  where 64 large chunks blow the context. */
 export const BATCH_SIZE = 64;
 
 const HTTP_TIMEOUT_MS = 60_000;
@@ -117,7 +120,7 @@ async function probe(): Promise<ProbeResult> {
   _probePromise = (async () => {
     const cfg = getCfg();
     const res = await fetchWithRetry(
-      `${cfg.baseUrl}/v1/embeddings`,
+      `${cfg.baseUrl}/embeddings`,
       buildRequestInit(cfg, "ping"),
       cfg,
       /* isProbe */ true,
@@ -234,7 +237,7 @@ function classifyHttpError(
       return new EmbedError(
         "model_not_found",
         `Model "${cfg.model}" not found on ${cfg.baseUrl}. ` +
-        `Run \`curl ${cfg.baseUrl}/v1/models\` to list available models.`,
+        `Run \`curl ${cfg.baseUrl}/models\` to list available models.`,
         res.status,
       );
     case 400:
@@ -319,11 +322,12 @@ export async function embedBatch(
     );
   }
 
-  const url = `${cfg.baseUrl}/v1/embeddings`;
+  const url = `${cfg.baseUrl}/embeddings`;
+  const batchSize = cfg.batchSize ?? BATCH_SIZE;
   const results: number[][] = new Array(texts.length);
 
-  for (let start = 0; start < texts.length; start += BATCH_SIZE) {
-    const batch = texts.slice(start, start + BATCH_SIZE);
+  for (let start = 0; start < texts.length; start += batchSize) {
+    const batch = texts.slice(start, start + batchSize);
     const res = await fetchWithRetry(url, buildRequestInit(cfg, batch), cfg);
     const body = await parseResponse(res);
     if (body.data.length !== batch.length) {
