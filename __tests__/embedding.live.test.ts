@@ -1,43 +1,57 @@
 /**
- * Embedding tests — exercise the real local ONNX pipeline.
+ * Embedding tests — exercise a LIVE OpenAI-compatible /v1/embeddings endpoint.
  *
- * The Xenova/all-MiniLM-L6-v2 model (~23 MB) is fetched from HuggingFace by
- * Transformers.js on first call to `embed()`. Subsequent runs read from the
- * Transformers.js cache (~/.cache/huggingface/...). No fixture data is bundled
- * with the repo.
+ * pi-local-rag no longer ships a bundled embedding model. To run these tests
+ * you must have an embedding server reachable at PI_RAG_EMBED_BASE_URL with
+ * PI_RAG_EMBED_MODEL loaded. Examples:
+ *
+ *   # llama.cpp
+ *   llama-server --model ./nomic-embed-text.Q8_0.gguf --embedding --pooling mean --port 8080
+ *   PI_RAG_EMBED_BASE_URL=http://localhost:8080 \
+ *   PI_RAG_EMBED_MODEL=nomic-embed-text \
+ *   PI_RAG_EMBED_LIVE=1 npm test -- embedding.live
+ *
+ *   # Ollama
+ *   ollama pull nomic-embed-text
+ *   PI_RAG_EMBED_BASE_URL=http://localhost:11434 \
+ *   PI_RAG_EMBED_MODEL=nomic-embed-text \
+ *   PI_RAG_EMBED_LIVE=1 npm test -- embedding.live
  *
  * This file lives separately from __tests__/index.test.ts because that file
- * mocks @xenova/transformers at module scope (to keep the SQLite-era
- * hybridSearch tests fast and deterministic). The mock returns a constant
- * 384-dim vector, which trivially fails normalization + semantic-similarity
- * checks. Splitting matches the upstream fork's layout — kallewoof's
- * __tests__/embedding.test.ts has no mock; __tests__/index.test.ts does.
+ * stubs globalThis.fetch with deterministic 384-dim vectors, which trivially
+ * fails semantic-similarity checks.
  *
- * Set SKIP_EMBEDDING_TESTS=1 to skip (e.g. in offline CI).
+ * Skipped by default — set PI_RAG_EMBED_LIVE=1 to opt in.
  */
 import { describe, it, expect, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
 import {
   embed, cosineSimilarity, hybridSearch, sha256, initSchema,
+  getVectorDim,
 } from "../index.ts";
 
-const skip = process.env.SKIP_EMBEDDING_TESTS === "1";
+const skip = process.env.PI_RAG_EMBED_LIVE !== "1";
 const EMBED_TIMEOUT = 120_000;
 
-// Close the cached DB singleton after every test so it can't leak into the next test
+// Close the cached DB singleton + reset embed probe cache after every test so
+// neither leaks into the next test.
 afterEach(async () => {
   const { closeDbConn } = await import("../db.ts");
   closeDbConn();
+  const { __resetProbeForTests } = await import("../embed.ts");
+  __resetProbeForTests();
 });
 
-describe("embed (real ONNX)", () => {
-  it.skipIf(skip)("returns a 384-dim unit-normalized vector for a single string", async () => {
+describe("embed (live HTTP)", () => {
+  it.skipIf(skip)("returns a unit-normalized vector of the configured dim", async () => {
     const v = await embed("hello world");
     expect(Array.isArray(v)).toBe(true);
-    expect(v.length).toBe(384);
+    expect(v.length).toBeGreaterThan(0);
     const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
-    expect(Math.abs(norm - 1)).toBeLessThan(1e-3);
+    // OpenAI/llama.cpp with --pooling mean return unit-normalized vectors.
+    // Allow a generous tolerance — some servers normalize within epsilon.
+    expect(Math.abs(norm - 1)).toBeLessThan(1e-2);
     expect(v.some(x => x !== 0)).toBe(true);
   }, EMBED_TIMEOUT);
 
@@ -56,25 +70,26 @@ describe("embed (real ONNX)", () => {
     const finance = await embed("Quarterly revenue exceeded analyst expectations by twelve percent.");
     const simRelated = cosineSimilarity(cat, kitten);
     const simUnrelated = cosineSimilarity(cat, finance);
+    // Threshold lowered vs. the original All-MiniLM-L6-v2 test: model-agnostic.
     expect(simRelated).toBeGreaterThan(simUnrelated + 0.1);
-    expect(simRelated).toBeGreaterThan(0.5);
+    expect(simRelated).toBeGreaterThan(0.3);
   }, EMBED_TIMEOUT);
 
   it.skipIf(skip)("hybridSearch: vector path retrieves semantically relevant chunks even without keyword overlap", async () => {
-    // Build an in-memory DB (matches createTestDb from index.test.ts but
-    // populates with REAL embeddings — this test specifically validates the
-    // semantic vector path end-to-end through sqlite-vec.
+    // Build an in-memory DB with REAL embeddings — validates the semantic
+    // vector path end-to-end through sqlite-vec.
     const chunks = [
       { content: "Photosynthesis is how plants convert sunlight into chemical energy.", file: "plants.md" },
       { content: "The team shipped a new dashboard for analytics reporting.", file: "shipping.md" },
       { content: "We pickled cucumbers in a vinegar brine with dill and garlic.", file: "recipe.md" },
     ];
     const vectors = await Promise.all(chunks.map(c => embed(c.content)));
+    const dim = getVectorDim();
 
     const db = new Database(":memory:");
     db.pragma("journal_mode = WAL");
     loadVec(db);
-    initSchema(db);
+    initSchema(db, dim);
 
     const insChunk = db.prepare(`
       INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)

@@ -3,8 +3,10 @@
 export const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 export const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31m", MAGENTA = "\x1b[35m";
 
-export const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
-export const VECTOR_DIM = 384;
+// Embedding backend — the actual embedding model is configured at runtime
+// via RagConfig.embeddingModel / PI_RAG_EMBED_MODEL (see embedConfig.ts).
+// This constant is just the fallback default.
+export const DEFAULT_EMBED_MODEL = "nomic-embed-text";
 
 export const DEFAULT_TEXT_EXTS = [
   ".md", ".mdx", ".txt", ".rst",

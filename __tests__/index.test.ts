@@ -16,26 +16,73 @@ import ignore from "ignore";
 import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
 
-// Mock @xenova/transformers so search/embed tests don't load the ~23 MB ONNX
-// model. The mocked pipeline handles both single-string and batched-array
-// inputs (commit 849e485 fix).
-vi.mock("@xenova/transformers", () => ({
-  pipeline: vi.fn().mockResolvedValue(
-    vi.fn().mockImplementation(async (texts: string | string[]) => {
-      // Mirror the real Xenova/transformers batch API: always return a single
-      // Tensor-like object whose `data` is a flat Float32Array of
-      // [batchSize × dim].  Single-string input is treated as batchSize=1.
-      const batch = Array.isArray(texts) ? texts : [texts];
-      const DIM = 384;
-      const flat = new Float32Array(batch.length * DIM).fill(0.1);
-      return { data: flat };
-    })
-  ),
-}));
-
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SAMPLE_PDF = readFileSync(join(__dirname, "fixtures", "sample.pdf"));
 const SAMPLE_IMAGE_PDF = readFileSync(join(__dirname, "fixtures", "sample-image.pdf"));
+
+// ─── fetch stub ─────────────────────────────────────────────────────────────
+//
+// pi-local-rag's embed.ts now POSTs to /v1/embeddings. We stub globalThis.fetch
+// so tests don't reach the network and we keep deterministic 384-dim vectors.
+//
+// The default stub returns a deterministic, text-derived 384-dim vector so
+// cosine-similarity assertions remain meaningful. Tests that need custom
+// behavior (errors, custom dims, out-of-order responses) can reassign
+// `currentFetchImpl` directly.
+
+const DEFAULT_DIM = 384;
+let currentFetchImpl: typeof fetch | null = null;
+const originalFetch = globalThis.fetch;
+
+function defaultEmbedFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const url = String(input);
+  if (!url.endsWith("/v1/embeddings")) {
+    return Promise.resolve(new Response("not found", { status: 404 }));
+  }
+  const body = JSON.parse(String(init?.body ?? "{}")) as { input: string | string[] };
+  const inputs = Array.isArray(body.input) ? body.input : [body.input];
+  return Promise.resolve(new Response(JSON.stringify({
+    object: "list",
+    model: "test-embed",
+    data: inputs.map((text, index) => ({
+      object: "embedding",
+      index,
+      // Deterministic hash → unit-ish vector. The exact values don't matter
+      // for the search tests; what matters is that two equal inputs produce
+      // equal vectors and two distinct inputs produce distinct vectors.
+      embedding: Array.from({ length: DEFAULT_DIM }, (_, k) => {
+        let h = 0;
+        for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+        return Math.sin(h + k) * 0.1;
+      }),
+    })),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+}
+
+beforeAll(() => {
+  // Pin the embed backend config so tests don't read random env state.
+  process.env.PI_RAG_EMBED_BASE_URL = "http://test-embed";
+  process.env.PI_RAG_EMBED_MODEL = "test-embed";
+  process.env.PI_RAG_EMBED_API_KEY = "";
+  // Tests use the same 384-dim schema as the old ONNX default.
+  process.env.PI_RAG_EMBED_DIMENSIONS = "384";
+});
+
+beforeEach(() => {
+  currentFetchImpl = defaultEmbedFetch;
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+    if (!currentFetchImpl) throw new Error("fetch stub not installed");
+    return currentFetchImpl(...args);
+  }) as typeof fetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  currentFetchImpl = null;
+});
 
 // Imports that don't depend on env-time state can be static.
 import {
@@ -69,7 +116,7 @@ function createTestDb(chunks: Array<{
   const db = new Database(":memory:");
   db.pragma("journal_mode = WAL");
   loadVec(db);
-  initSchema(db);
+  initSchema(db, 384);
 
   const insChunk = db.prepare(`
     INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
@@ -149,6 +196,9 @@ function chunkFixture(file: string, content: string, lineStart = 1) {
 afterEach(async () => {
   const { closeDbConn } = await import("../db.ts");
   closeDbConn();
+  // Reset embed.ts' cached probe dim so each test starts with a fresh probe.
+  const { __resetProbeForTests } = await import("../embed.ts");
+  __resetProbeForTests();
 });
 
 // ─── chunkText ──────────────────────────────────────────────────────────────
@@ -929,11 +979,11 @@ describe("/rag find glob matching", () => {
   });
 });
 
-// ─── embed + hybrid (real ONNX pipeline; opt-out via SKIP_EMBEDDING_TESTS) ──
+// ─── embed + hybrid (live HTTP pipeline; opt-in via PI_RAG_EMBED_LIVE=1) ──
 
-// (Real-ONNX embed + vector-path hybridSearch tests live in __tests__/embedding.test.ts —
-// that file deliberately doesn't mock @xenova/transformers, matching the
-// fork's split between index.test.ts (mocked) and embedding.test.ts (real).)
+// (Live embed + vector-path hybridSearch tests live in __tests__/embedding.live.test.ts —
+// that file deliberately doesn't stub globalThis.fetch, matching the
+// fork's split between index.test.ts (mocked) and embedding.live.test.ts (real).)
 
 // ─── Storage: loadConfig / saveConfig / loadIndex / saveIndex / ensureDir ───
 //
@@ -1046,14 +1096,15 @@ describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => 
         VALUES (?, ?, ?, ?, ?, ?)
       `).run("/some/file.ts", "deadbeef", 1, "2026-05-15T00:00:00Z", 19, 1);
       db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run("2026-05-15T00:00:00Z");
-      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run("Xenova/all-MiniLM-L6-v2");
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run("test-embed");
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('vector_dim', ?)").run("384");
     } finally {
       db.close();
     }
 
     const read = mod.loadIndex();
     expect(read.lastBuild).toBe("2026-05-15T00:00:00Z");
-    expect(read.embeddingModel).toBe("Xenova/all-MiniLM-L6-v2");
+    expect(read.embeddingModel).toBe("test-embed");
     expect(read.chunks).toHaveLength(1);
     expect(read.chunks[0].id).toBe("abc-1");
     expect(read.chunks[0].file).toBe("/some/file.ts");

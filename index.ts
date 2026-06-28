@@ -2,7 +2,7 @@
  * pi-local-rag — Hybrid RAG Pipeline (BM25 + Vector + Auto-injection)
  *
  * Index local files → chunk → embed → store → retrieve → inject into LLM context.
- * Uses Transformers.js (ONNX) for local embeddings — zero cloud dependency.
+ * Embeddings come from a configurable OpenAI-compatible /v1/embeddings endpoint.
  *
  * Storage is per-cwd: walk up from the working directory looking for a `.pi/rag/`
  * project store; fall back to `~/.pi/rag/` as the global default. The first
@@ -31,7 +31,8 @@
  *   config.ts        — RagConfig type, loadConfig / saveConfig, ext helpers
  *   index-store.ts   — Chunk / IndexMeta types, loadIndex / saveIndex (JSON)
  *   chunking.ts      — sha256, chunkText, collectFiles, extractText (txt/pdf/docx/html)
- *   embed.ts         — getEmbedder, embed, embedBatch (ONNX via @xenova/transformers)
+ *   embed.ts         — embed, embedBatch (HTTP client for /v1/embeddings)
+ *   embedConfig.ts   — resolveEmbedConfig: merges env + config + defaults
  *   search.ts        — cosineSimilarity, normalize, hybridSearch
  *   indexing.ts      — indexFiles (parallel Phase 1 read, sequential Phase 2 embed)
  *   index.ts         — extension entry point (this file) + re-exports
@@ -48,8 +49,9 @@ import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, saveIndex, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
-import { hybridSearch } from "./search.ts";
+import { hybridSearch, type ScoredChunk } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
+import { EmbedError } from "./embed.ts";
 
 // Re-export the public surface so existing consumers of `pi-local-rag` keep
 // working (tests, downstream code that imports from the package root).
@@ -79,7 +81,7 @@ export default function (pi: ExtensionAPI) {
   const STALE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
   // ── Auto-inject RAG context before every agent turn ──
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
@@ -97,12 +99,27 @@ export default function (pi: ExtensionAPI) {
         : getIndexedFiles().map(f => f.path).filter(f => existsSync(f));
       if (files.length) {
         process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
-        await indexFiles(files, undefined);
+        try {
+          await indexFiles(files, undefined);
+        } catch (e) {
+          if (e instanceof EmbedError) {
+            ctx.ui.notify(`[rag] refresh failed: ${e.message}`, "error");
+          } else { throw e; }
+        }
         process.stderr.write(`\r\x1b[2K`);
       }
     }
 
-    const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha);
+    let results: ScoredChunk[];
+    try {
+      results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha);
+    } catch (e) {
+      if (e instanceof EmbedError) {
+        ctx.ui.notify(`[rag] ${e.message}`, "error");
+        return;
+      }
+      throw e;
+    }
     const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
     if (!relevant.length) return;
 
@@ -296,6 +313,26 @@ export default function (pi: ExtensionAPI) {
           // skip-on-equal-hash check.
           database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
           database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
+          // Drop and re-create the vec table so it picks up the current
+          // configured vector dim. This is the explicit path for the
+          // "switched embedding model" case — data loss is intentional.
+          database.exec("DROP TABLE IF EXISTS chunks_vec;");
+          const { resolveEmbedConfig } = await import("./embedConfig.ts");
+          const { initSchema } = await import("./db.ts");
+          const { getVectorDim } = await import("./embed.ts");
+          const { loadConfig } = await import("./config.ts");
+          const embCfg = resolveEmbedConfig(loadConfig());
+          let dim = embCfg.dimensions;
+          if (dim === undefined) {
+            try { dim = getVectorDim(); } catch { dim = undefined; }
+          }
+          if (dim === undefined) {
+            // Last resort: run a probe by calling embed with a trivial string.
+            const { embed } = await import("./embed.ts");
+            const probe = await embed("dim-probe");
+            dim = probe.length;
+          }
+          initSchema(database, dim);
         } else {
           for (const f of targetFiles) {
             database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
@@ -567,6 +604,8 @@ export default function (pi: ExtensionAPI) {
       // ── status (default) ──
       const indexStats = getIndexStats();
       const config = loadConfig();
+      const { resolveEmbedConfig } = await import("./embedConfig.ts");
+      const embCfg = resolveEmbedConfig(config);
       const fileCount = indexStats.totalFiles;
       const totalTokens = indexStats.totalTokens;
       const embeddedCount = indexStats.embeddedCount;
@@ -585,6 +624,7 @@ export default function (pi: ExtensionAPI) {
         "  " + label("Vectors:")        + val(embeddedCount) + "  " + th.fg("dim", `(${vectorCoverage}% coverage)`),
         "  " + label("Total tokens:")   + val(totalTokens.toLocaleString()),
         "  " + label("Embedding model:") + th.fg("dim", indexStats.embeddingModel || "none"),
+        "  " + label("Vector dim:")     + th.fg("dim", indexStats.vectorDim ? String(indexStats.vectorDim) : "unknown"),
         "  " + label("Last build:")     + (indexStats.lastBuild || th.fg("dim", "never")),
         "  " + label("Storage:")        + th.fg("dim", `${ragDir} (${scope})`),
         "",
@@ -592,6 +632,16 @@ export default function (pi: ExtensionAPI) {
           (config.ragEnabled ? th.fg("success", "enabled") : th.fg("warning", "disabled")) +
           th.fg("dim", `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}`),
       ];
+
+      // Dim-mismatch warning: resolved config dim (or probe) disagrees with
+      // what's stored in the DB. The user needs `/rag rebuild --force`.
+      if (indexStats.vectorDim && embCfg.dimensions && embCfg.dimensions !== indexStats.vectorDim) {
+        lines.push(
+          "",
+          th.fg("warning", `  ⚠ Resolved dim=${embCfg.dimensions} but index has dim=${indexStats.vectorDim}.`) +
+          th.fg("dim", " Run `/rag rebuild --force` to re-embed."),
+        );
+      }
 
       if (fileCount) {
         lines.push("", "  " + th.bold("File types:"));

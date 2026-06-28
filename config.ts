@@ -11,6 +11,13 @@ export interface RagConfig {
   excludeExtensions: string[]; // extensions to drop from the default set
   trackedPaths: string[];      // absolute paths previously passed to /rag index
   excludePatterns: string[];   // gitignore-style path patterns
+  // Embedding backend (OpenAI-compatible /v1/embeddings endpoint).
+  // All optional; unset means use PI_RAG_EMBED_* env or built-in defaults
+  // (llama.cpp on localhost:8080, model nomic-embed-text).
+  embeddingBaseUrl?: string;
+  embeddingModel?: string;
+  embeddingApiKey?: string;
+  embeddingDimensions?: number;
 }
 
 export function defaultConfig(): RagConfig {

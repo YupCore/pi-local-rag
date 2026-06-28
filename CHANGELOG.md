@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0
+
+### Breaking
+
+- **Dropped `@xenova/transformers`** and the bundled `Xenova/all-MiniLM-L6-v2` ONNX model. pi-local-rag now POSTs to a remote OpenAI-compatible `/v1/embeddings` endpoint instead of running the model in-process. You bring your own embedding server — see README § Embeddings backend.
+- **Removed `EMBEDDING_MODEL` and `VECTOR_DIM` exports** from `constants.ts`. The vector dim is now runtime-discovered from the server (or pinned via `PI_RAG_EMBED_DIMENSIONS` / `config.embeddingDimensions`).
+- **`VECTOR_DIM = 384` is no longer a constant.** The sqlite-vec schema is created with the actual dim of your server. Migration when you switch models: `/rag rebuild --force` (now also drops + recreates `chunks_vec`).
+
+### Added
+
+- **New `embed.ts` HTTP client**: `fetch`-based, batched up to 64 inputs per call, with exponential-backoff retries (3 attempts), `AbortSignal.timeout`, defensive result ordering by `index`, and `EmbedError` class with per-failure-class messages (`unreachable`, `auth`, `model_not_found`, `bad_request`, `rate_limited`, `dim_mismatch`, `parse`, `timeout`, `unknown`).
+- **New `embedConfig.ts`** resolver: merges env + `config.json` + built-in defaults into a single `ResolvedEmbedConfig`. `/v1` is auto-appended to the base URL.
+- **New `RagConfig` fields**: `embeddingBaseUrl`, `embeddingModel`, `embeddingApiKey`, `embeddingDimensions` (all optional).
+- **New env vars**: `PI_RAG_EMBED_BASE_URL`, `PI_RAG_EMBED_MODEL`, `PI_RAG_EMBED_API_KEY`, `PI_RAG_EMBED_DIMENSIONS`. Precedence: env > config > default.
+- **`vector_dim` metadata key** persisted in `rag.db` after every build. `/rag status` shows it and warns when the resolved dim disagrees with the stored dim.
+- **`/rag rebuild --force`** now also drops + recreates the `chunks_vec` vec table with the current dim, then re-embeds all tracked files. This is the explicit, non-silent migration path when you change embedding models.
+- **`before_agent_start` hook catches `EmbedError`** and routes the failure to `ctx.ui.notify` instead of crashing the agent turn. Stale-index refresh does the same.
+- **New `__tests__/embedHttp.test.ts`**: pure unit tests for retry / auth / timeout / parse / dim-mismatch / ordering against a `vi.fn()` fetch stub.
+- **New `__tests__/embedding.live.test.ts`** (renamed from `embedding.test.ts`): hits a real `/v1/embeddings` server, gated on `PI_RAG_EMBED_LIVE=1`, excluded from the default test run.
+
+### Changed
+
+- **`embedBatch` semantics**: now groups of 64 inputs go out as one HTTP POST (was 256 with in-process ONNX). The cross-file `EMBED_GROUP_TARGET` in `indexing.ts` was lowered from 256 to 64 to match.
+- **`__tests__/index.test.ts`**: mock of `@xenova/transformers` replaced with a `globalThis.fetch` stub that returns deterministic text-derived 384-dim vectors.
+- **README** rewritten: removed "zero cloud / works fully offline" framing; added Embeddings backend section with llama.cpp / Ollama / LM Studio / vLLM / OpenAI recipes; added Switching models subsection.
+- **`package.json`**: removed `@xenova/transformers` from dependencies (~22 MB lighter bundle); updated description; replaced `transformers` keyword with `openai-compatible`, `llama-cpp`, `ollama`, `vllm`, `lm-studio`.
+
 ## 0.4.1
 
 - **Docs refresh**: README rewritten for 0.4.0 feature set — SQLite/FTS5/sqlite-vec storage, PDF/DOCX/HTML extraction, OCR fallback, per-project store, tracked paths + exclude patterns, 24 h auto-refresh, trailing-message auto-injection. Commands table expanded with `/rag find`, `/rag refresh`, `/rag rebuild --force`, `/rag exclude`, `/rag help`. Optional OCR install instructions (`brew install poppler tesseract tesseract-lang` / `apt install poppler-utils tesseract-ocr ...`). New "Testing" section noting `SKIP_EMBEDDING_TESTS` and the tesseract-absent OCR skip.

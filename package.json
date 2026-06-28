@@ -1,7 +1,7 @@
 {
   "name": "pi-local-rag",
-  "version": "0.4.1",
-  "description": "Local hybrid RAG pipeline for the Pi coding agent. SQLite FTS5 + sqlite-vec, ONNX embeddings via Transformers.js, PDF/DOCX/HTML extraction (with OCR fallback), per-project storage, auto-injection. Zero cloud dependency.",
+  "version": "0.5.0",
+  "description": "Hybrid RAG pipeline for the Pi coding agent. SQLite FTS5 + sqlite-vec, embeddings via any OpenAI-compatible /v1/embeddings endpoint (llama.cpp, Ollama, vLLM, LM Studio, OpenAI). PDF/DOCX/HTML extraction with OCR fallback. Per-project storage. Auto-injection.",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -15,6 +15,7 @@
     "db.ts",
     "chunking.ts",
     "embed.ts",
+    "embedConfig.ts",
     "search.ts",
     "indexing.ts",
     "types/**/*.d.ts",
@@ -42,8 +43,12 @@
     "hybrid-search",
     "index",
     "local",
-    "offline",
-    "transformers",
+    "openai-compatible",
+    "llama-cpp",
+    "llamacpp",
+    "ollama",
+    "vllm",
+    "lm-studio",
     "sqlite",
     "fts5",
     "sqlite-vec",
@@ -73,7 +78,6 @@
     ]
   },
   "dependencies": {
-    "@xenova/transformers": "^2.17.2",
     "better-sqlite3": "^12.10.0",
     "ignore": "^7.0.5",
     "mammoth": "^1.8.0",

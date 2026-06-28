@@ -1,17 +1,78 @@
 # pi-local-rag
 
-Local hybrid RAG pipeline for the [Pi coding agent](https://github.com/badlogic/pi-mono). Index your local files and search them with BM25 + vector similarity — **zero cloud dependency, works fully offline**.
+Hybrid RAG pipeline for the [Pi coding agent](https://github.com/badlogic/pi-mono). Index your local files and search them with BM25 + vector similarity — embeddings come from **any OpenAI-compatible `/v1/embeddings` endpoint** you point it at (llama.cpp, Ollama, vLLM, LM Studio, or OpenAI itself).
 
 ## Features
 
-- **Hybrid BM25 + vector search** — SQLite FTS5 for keyword scoring, [`sqlite-vec`](https://github.com/asg017/sqlite-vec) for 384-dim cosine NN, blended at retrieval time
-- **Local ONNX embeddings** — `Xenova/all-MiniLM-L6-v2` via Transformers.js (~23 MB model, runs fully offline after first download)
+- **Hybrid BM25 + vector search** — SQLite FTS5 for keyword scoring, [`sqlite-vec`](https://github.com/asg017/sqlite-vec) for cosine NN, blended at retrieval time
+- **Pluggable embeddings** — point at any OpenAI-compatible `/v1/embeddings` endpoint. Defaults to `nomic-embed-text` on a llama.cpp server at `localhost:8080`. Fully local if you want; cloud if you want.
 - **Many file formats** — text, source code, Markdown, JSON, YAML, plus PDF (with optional OCR fallback for scanned docs), DOCX, HTML (auto-converted to Markdown)
 - **Per-project storage** — walks up from cwd looking for `.pi/rag/`; falls back to `~/.pi/rag/` global store
 - **Tracked paths + exclude patterns** — `/rag index <path>` remembers what to keep current; gitignore-style `/rag exclude` for `dist/`, `*.log`, etc.
 - **Auto-refresh** — stale index (>24 h) silently refreshed before the next agent turn; manual `/rag refresh` for on-demand incremental updates
 - **Auto-injection** — relevant chunks appended after the user prompt before every agent turn (KV-cache friendly)
 - **3 AI tools** — `rag_index`, `rag_query`, `rag_status` for the agent to call directly
+
+## Embeddings backend
+
+pi-local-rag no longer ships a bundled embedding model. You need a server exposing `POST /v1/embeddings` with the OpenAI schema. The default config assumes **llama.cpp server** at `http://localhost:8080` with `nomic-embed-text` loaded.
+
+### Quickstart: llama.cpp (recommended for fully-local use)
+
+```bash
+# 1. Build llama.cpp (one-time) — see https://github.com/ggml-org/llama.cpp
+
+# 2. Download a GGUF embedding model, e.g.:
+#    huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF (nomic-embed-text.Q8_0.gguf)
+
+# 3. Start an embeddings-only server on port 8080:
+llama-server \
+  --model ./nomic-embed-text.Q8_0.gguf \
+  --embedding \
+  --pooling mean \
+  --port 8080
+```
+
+The `--embedding` flag restricts llama.cpp to embedding mode. If you also need a chat server, run it as a separate process on a different port.
+
+### Other backends
+
+| Backend | URL | Notes |
+|---|---|---|
+| **Ollama** | `http://localhost:11434` | Set `PI_RAG_EMBED_MODEL=nomic-embed-text` after `ollama pull`. API key ignored. |
+| **LM Studio** | `http://localhost:1234` | Enable the local server in the LM Studio UI. Load an embedding model first. |
+| **vLLM** | `http://localhost:8000` | `vllm serve nomic-ai/nomic-embed-text-v1.5 --port 8000` |
+| **OpenAI** | `https://api.openai.com/v1` | Set `PI_RAG_EMBED_API_KEY=sk-...` and `PI_RAG_EMBED_MODEL=text-embedding-3-small` |
+
+### Configuration
+
+All settings are optional. Resolution precedence per field: **env var > `config.json` > built-in default**.
+
+| Field | Env var | Default | Notes |
+|---|---|---|---|
+| `embeddingBaseUrl` | `PI_RAG_EMBED_BASE_URL` | `http://localhost:8080` | `/v1` is auto-appended. |
+| `embeddingModel` | `PI_RAG_EMBED_MODEL` | `nomic-embed-text` | Must match what's loaded in your server. |
+| `embeddingApiKey` | `PI_RAG_EMBED_API_KEY` | `""` | Required for OpenAI; ignored by Ollama. |
+| `embeddingDimensions` | `PI_RAG_EMBED_DIMENSIONS` | (probed from server) | Only relevant for OpenAI text-embedding-3-* truncation. |
+
+Example `~/.pi/rag/config.json`:
+
+```json
+{
+  "embeddingBaseUrl": "http://localhost:11434",
+  "embeddingModel": "nomic-embed-text"
+}
+```
+
+### Switching models
+
+When you change `embeddingModel` (or switch to a model with a different output dimension), the existing index has vectors in the wrong shape. Run:
+
+```text
+/rag rebuild --force
+```
+
+This drops the `chunks_vec` table, recreates it with the new dim, and re-embeds every tracked file.
 
 ## Install
 
@@ -45,7 +106,7 @@ The OCR fallback is silent when these tools aren't installed (logs one stderr hi
 | `/rag search <query>` | Hybrid BM25 + vector search over the index |
 | `/rag find <glob>` | List indexed files matching a glob (e.g. `*.ts`, `src/*`) |
 | `/rag status` | Show index stats, active config, tracked paths, exclude patterns, storage scope |
-| `/rag rebuild [--force]` | Re-walk tracked paths and re-embed all files. `--force` wipes the DB and bypasses the hash-cache check |
+| `/rag rebuild [--force]` | Re-walk tracked paths and re-embed all files. `--force` wipes the DB and (re)creates the vec table with the current dim. |
 | `/rag refresh` | Incremental refresh — only new/changed files (same code path as the 24 h auto-refresh) |
 | `/rag clear` | Wipe the entire index (tracked paths are preserved) |
 | `/rag exclude <pattern>` | Add a gitignore-style exclude pattern; `/rag exclude -<pattern>` to remove; no arg to list |
@@ -72,7 +133,8 @@ $ /rag status
   Chunks:           1847
   Vectors:          1847  (100% coverage)
   Total tokens:     438,219
-  Embedding model:  Xenova/all-MiniLM-L6-v2
+  Embedding model:  nomic-embed-text
+  Vector dim:       768
   Last build:       2026-05-26T20:14:03.221Z
   Storage:          /Users/you/code/my-app/.pi/rag (project)
 
@@ -82,7 +144,7 @@ $ /rag status
     .ts    231
     .tsx   118
     .md     34
-    .json   18
+    .json    18
     .yaml    7
 
   Tracked paths:
@@ -103,23 +165,6 @@ webhooks.md:1-23  score=0.71
   # Webhook signing
   All inbound webhooks are verified against the shared secret stored in
   STRIPE_WEBHOOK_SECRET. Stripe signs each request with a t= timestamp...
-
-$ /rag exclude dist/
-✅ Added exclude: dist/ · 1 pattern(s) total. Run /rag rebuild to re-apply.
-
-$ /rag find *.html
-🔍 12 indexed files matching "*.html"
-src/docs/install.html
-src/docs/quickstart.html
-...
-
-$ /rag rebuild
-Scanning tracked paths...
-Discovered 3 new files
-Rebuilding 415 files...
-Rebuilding  ████████████████████████  100%
-Embedding   ████████████████████████  100%  1847/1847 chunks
-✅ Rebuilt: 3 re-indexed · 412 unchanged · 0 deleted · 1850 chunks · 14.2s
 ```
 
 > Output above is approximate — actual colors, spacing, and widget layout depend on your terminal theme and the Pi agent's UI.
@@ -134,7 +179,7 @@ The extension registers three tools the agent can call directly:
 
 ## How It Works
 
-1. **Index** — files are chunked (~50 lines each, broken at blank lines where possible), embedded with `Xenova/all-MiniLM-L6-v2` (384-dim), and stored in SQLite. PDF/DOCX go through `pdf-parse`/`mammoth`; HTML is converted to Markdown via `turndown`; scanned PDFs fall back to OCR (`pdftoppm` + `tesseract`) when the system tools are installed.
+1. **Index** — files are chunked (~50 lines each, broken at blank lines where possible) and sent to your configured `/v1/embeddings` endpoint. Resulting vectors are stored in `chunks_vec` via `sqlite-vec`. PDF/DOCX go through `pdf-parse`/`mammoth`; HTML is converted to Markdown via `turndown`; scanned PDFs fall back to OCR (`pdftoppm` + `tesseract`) when the system tools are installed.
 2. **Search** — FTS5 `bm25()` + `sqlite-vec` cosine NN, normalized and blended: `alpha × BM25 + (1-alpha) × cosine` (default `alpha=0.4`). Filename matches on the first query term get a 1.5× boost.
 3. **Auto-inject** — before every agent turn, the user's prompt is searched against the index and relevant chunks are appended after the prompt as a hidden `customType: "rag"` message (KV-cache friendly — the system prompt is unchanged across turns).
 4. **Auto-refresh** — if the index is older than 24 h, the `before_agent_start` hook re-walks tracked paths and re-indexes new/changed files in the background. Throttled to one stale check per hour.
@@ -165,12 +210,20 @@ Auto-injection is on by default. Config lives in `<ragDir>/config.json`:
 | `excludeExtensions` | `[]` | Default extensions to skip |
 | `trackedPaths` | `[]` | Absolute paths that `/rag rebuild`/`refresh` re-walk |
 | `excludePatterns` | `[]` | Gitignore-style patterns applied when walking tracked paths |
+| `embeddingBaseUrl` | env/`http://localhost:8080` | OpenAI-compatible embeddings endpoint |
+| `embeddingModel` | env/`nomic-embed-text` | Model id passed as `model` in the request body |
+| `embeddingApiKey` | env/`""` | Sent as `Authorization: Bearer …` |
+| `embeddingDimensions` | env/(probed) | Optional dim hint for OpenAI text-embedding-3-* truncation |
 
 ## Testing
 
 ```bash
-npm test                          # full suite (downloads ~23 MB model on first run)
-SKIP_EMBEDDING_TESTS=1 npm test   # skip the real-ONNX semantic tests
+npm test                                 # fast: unit tests with mocked fetch
+npm test -- embedding.live               # opt-in: hits a real /v1/embeddings server
+PI_RAG_EMBED_LIVE=1 \
+  PI_RAG_EMBED_BASE_URL=http://localhost:8080 \
+  PI_RAG_EMBED_MODEL=nomic-embed-text \
+  npm test -- embedding.live
 ```
 
 OCR end-to-end test is skipped when `tesseract` isn't installed.

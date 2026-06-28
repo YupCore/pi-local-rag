@@ -1,8 +1,9 @@
 import { basename } from "node:path";
 import Database from "better-sqlite3";
 import { getDbConn, float32ToBuffer, type IndexStats } from "./db.ts";
-import { EMBEDDING_MODEL } from "./constants.ts";
-import { embedBatch } from "./embed.ts";
+import { embedBatch, getVectorDim } from "./embed.ts";
+import { resolveEmbedConfig } from "./embedConfig.ts";
+import { loadConfig } from "./config.ts";
 import { chunkText, extractText, sha256 } from "./chunking.ts";
 
 export interface ProgressCallbacks {
@@ -141,7 +142,9 @@ export async function indexFiles(
     skipped += readErrorCount;
 
     // Phase 2: embed in cross-file groups
-    const EMBED_GROUP_TARGET = 256;
+    // Each group is one HTTP POST with up to BATCH_SIZE inputs; keep
+    // group size aligned with embed.ts' BATCH_SIZE.
+    const EMBED_GROUP_TARGET = 64;
     const groupChunks: { fw: FileWork; ci: number }[] = [];
     let globalChunkIdx = 0;
     const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
@@ -211,8 +214,13 @@ export async function indexFiles(
 
     if (!hadCallbacks) process.stderr.write(`\r\x1b[2K`);
     progress?.onSave?.();
-    database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(new Date().toISOString());
-    database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(EMBEDDING_MODEL);
+    const embCfg = resolveEmbedConfig(loadConfig());
+    const metaTx = database.transaction(() => {
+      database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(new Date().toISOString());
+      database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(embCfg.model);
+      database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('vector_dim', ?)").run(String(getVectorDim()));
+    });
+    metaTx();
 
     return { indexed: toIndex.length, chunks: chunked, skipped, durationMs: Date.now() - startMs };
   } finally {
