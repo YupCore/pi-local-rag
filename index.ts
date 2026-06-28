@@ -206,17 +206,24 @@ export default function (pi: ExtensionAPI) {
 
         const result = await indexFiles(files, {
           onFile(current, total, filename, skipped) {
-            const pct = Math.round((current / total) * 100);
-            const bar = progressBar(current, total);
-            ctx.ui.setStatus("rag", `■ Indexing ${pct}% │ ${current}/${total} files │ ${skipped} unchanged`);
+            // Phase 1 — file reads. Show a "reading" status with file count.
+            ctx.ui.setStatus("rag", `■ Reading ${current}/${total} files`);
             ctx.ui.setWidget("rag", [
-              `${B}${CYAN}Indexing${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+              `${B}${CYAN}Indexing${RST}  ${D}reading files…${RST}`,
               `${D}file:    ${RST}${filename}`,
-              `${D}done:    ${RST}${GREEN}${current - skipped} embedded${RST}  ${D}${skipped} unchanged${RST}`,
+              `${D}done:    ${RST}${current}/${total} files read${RST}  ${D}${skipped} unchanged${RST}`,
             ]);
           },
-          onChunk(ci, total, filename) {
-            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+          onEmbed(done, total) {
+            // Phase 2 — embedding (the slow phase). The bar tracks chunks done
+            // since that's what dominates wall time.
+            const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+            const bar = progressBar(done, total);
+            ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+            ctx.ui.setWidget("rag", [
+              `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+              `${D}chunks:  ${RST}${done}/${total}`,
+            ]);
           },
           onSave() {
             ctx.ui.setStatus("rag", `■ Saving index...`);
