@@ -119,7 +119,7 @@ export async function hybridSearch(
     }
   }
 
-  // Normalize distances → cosine → min-max
+  // Normalize distances → cosine → min-max (mutate vecNormMap in place)
   const vecNormMap = new Map<number, number>();
   if (hasVectors) {
     for (const r of vecResults as any[]) {
@@ -130,12 +130,9 @@ export async function hybridSearch(
     const cosMin = Math.min(...cosines);
     const cosRange = cosMax - cosMin;
     if (cosRange > 0) {
-      const normalized = new Map<number, number>();
       for (const [rowid, cos] of vecNormMap) {
-        normalized.set(rowid, (cos - cosMin) / cosRange);
+        vecNormMap.set(rowid, (cos - cosMin) / cosRange);
       }
-      vecNormMap.clear();
-      for (const [k, v] of normalized) vecNormMap.set(k, v);
     } else {
       for (const k of vecNormMap.keys()) vecNormMap.set(k, 1);
     }

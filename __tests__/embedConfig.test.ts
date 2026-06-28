@@ -17,6 +17,7 @@ const ENV_KEYS = [
   "PI_RAG_EMBED_MODEL",
   "PI_RAG_EMBED_API_KEY",
   "PI_RAG_EMBED_DIMENSIONS",
+  "PI_RAG_EMBED_CONCURRENCY",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -115,6 +116,32 @@ describe("resolveEmbedConfig — precedence", () => {
     process.env.PI_RAG_EMBED_DIMENSIONS = "768";
     const r = resolveEmbedConfig(cfgWith({ embeddingDimensions: 384 }));
     expect(r.dimensions).toBe(768);
+  });
+
+  it("concurrency: env wins over config", () => {
+    process.env.PI_RAG_EMBED_CONCURRENCY = "8";
+    const r = resolveEmbedConfig(cfgWith({ embeddingConcurrency: 2 }));
+    expect(r.concurrency).toBe(8);
+  });
+
+  it("concurrency: config wins when env unset", () => {
+    const r = resolveEmbedConfig(cfgWith({ embeddingConcurrency: 5 }));
+    expect(r.concurrency).toBe(5);
+  });
+
+  it("concurrency: undefined when neither env nor config set", () => {
+    expect(resolveEmbedConfig(cfgWith()).concurrency).toBeUndefined();
+  });
+
+  it("concurrency: ignores invalid env values (0, negative, non-numeric)", () => {
+    process.env.PI_RAG_EMBED_CONCURRENCY = "0";
+    expect(resolveEmbedConfig(cfgWith({ embeddingConcurrency: 5 })).concurrency).toBe(5);
+
+    process.env.PI_RAG_EMBED_CONCURRENCY = "-3";
+    expect(resolveEmbedConfig(cfgWith({ embeddingConcurrency: 5 })).concurrency).toBe(5);
+
+    process.env.PI_RAG_EMBED_CONCURRENCY = "abc";
+    expect(resolveEmbedConfig(cfgWith({ embeddingConcurrency: 5 })).concurrency).toBe(5);
   });
 });
 

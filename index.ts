@@ -47,7 +47,7 @@ import ignore from "ignore";
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, getIndexStats } from "./db.ts";
+import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, getIndexStats, getChunkCount } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch, type ScoredChunk } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
@@ -84,8 +84,11 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
+    // Cheap early-bail — single COUNT(*) instead of the 4-query getIndexStats().
+    // The full stats are only needed when the index is non-empty (below).
+    if (getChunkCount() === 0) return;
+
     const indexStats = getIndexStats();
-    if (indexStats.totalChunks === 0) return;
 
     const now = Date.now();
     if (isIndexStale(indexStats) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {

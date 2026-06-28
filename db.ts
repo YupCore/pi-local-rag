@@ -220,6 +220,13 @@ export function getEmbeddedCount(): number {
   return vecRow.embeddedCount;
 }
 
+/** Single COUNT(*) against chunks — cheap, runs on every auto-inject turn. */
+export function getChunkCount(db?: Database.Database): number {
+  const dbConn = db ?? getDbConn();
+  const row = dbConn.prepare("SELECT COUNT(*) AS c FROM chunks").get() as { c: number };
+  return row.c;
+}
+
 export function getIndexedFiles(): FileDbEntry[] {
   const db = getDbConn();
   return (db.prepare("SELECT * FROM files").all() as Array<FileDbEntry>);

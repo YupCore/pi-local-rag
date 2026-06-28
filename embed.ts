@@ -1,6 +1,7 @@
 // embed.ts — HTTP client for an OpenAI-compatible /v1/embeddings endpoint.
 // Public surface (embed, embedBatch, BATCH_SIZE) is unchanged.
 
+import { createHash } from "node:crypto";
 import { loadConfig } from "./config.ts";
 import { resolveEmbedConfig } from "./embedConfig.ts";
 
@@ -42,6 +43,16 @@ interface ProbeResult { dim: number }
 /** Module-level cache of the server's vector dim, populated by the first probe(). */
 let _dim: number | null = null;
 
+// Module-scope cache of resolveEmbedConfig(loadConfig()). Env vars + config
+// file don't change mid-session under normal use, so caching saves the ~5 env
+// reads + (with config.ts' own mtime cache) the loadConfig disk read per call.
+// Indexing fires probe/embedBatch hundreds of times in one session; this is the
+// difference between re-resolving on every call and a single hash + lookup.
+let _cfgCache: ReturnType<typeof resolveEmbedConfig> | null = null;
+function getCfg(): ReturnType<typeof resolveEmbedConfig> {
+  return _cfgCache ??= resolveEmbedConfig(loadConfig());
+}
+
 /** Yield to the event loop so the TUI can render progress updates. */
 const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 
@@ -49,13 +60,15 @@ const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 export function __resetProbeForTests(): void {
   _dim = null;
   _probePromise = null;
+  _cfgCache = null;
+  _embedCache.clear();
 }
 
 /** Returns the resolved vector dim: explicit config hint if set, else the
  *  server-probed dim (from the most recent embedBatch/embed call). Throws if
  *  called before any embed has happened and no hint is configured. */
 export function getVectorDim(): number {
-  const cfg = resolveEmbedConfig(loadConfig());
+  const cfg = getCfg();
   if (cfg.dimensions) return cfg.dimensions;
   if (_dim !== null) return _dim;
   throw new EmbedError(
@@ -64,6 +77,32 @@ export function getVectorDim(): number {
     "PI_RAG_EMBED_DIMENSIONS / config.embeddingDimensions is unset. " +
     "Call embed() once, or pin the dim explicitly.",
   );
+}
+
+// LRU cache for embed(text). Same (model, text) → same embedding (deterministic
+// across server calls), so caching is safe. Hit rate is low for distinct
+// prompts but useful for repeated queries (auto-inject on retry, similar
+// follow-ups). 32 entries ≈ 32 × ~3 KB ≈ 100 KB max.
+const EMBED_CACHE_MAX = 32;
+const _embedCache = new Map<string, number[]>();
+function cacheKey(model: string, text: string): string {
+  return model + "\0" + createHash("sha256").update(text).digest("hex").slice(0, 12);
+}
+function cacheLookup(key: string): number[] | undefined {
+  const hit = _embedCache.get(key);
+  if (hit !== undefined) {
+    // Map preserves insertion order — re-insert to bump LRU position.
+    _embedCache.delete(key);
+    _embedCache.set(key, hit);
+  }
+  return hit;
+}
+function cacheStore(key: string, vec: number[]): void {
+  if (_embedCache.size >= EMBED_CACHE_MAX) {
+    const oldest = _embedCache.keys().next().value;
+    if (oldest !== undefined) _embedCache.delete(oldest);
+  }
+  _embedCache.set(key, vec);
 }
 
 // ─── Probe (one-shot, cached) ────────────────────────────────────────────────
@@ -76,7 +115,7 @@ async function probe(): Promise<ProbeResult> {
   if (_dim !== null) return { dim: _dim };
   if (_probePromise) return _probePromise;
   _probePromise = (async () => {
-    const cfg = resolveEmbedConfig(loadConfig());
+    const cfg = getCfg();
     const res = await fetchWithRetry(
       `${cfg.baseUrl}/v1/embeddings`,
       buildRequestInit(cfg, "ping"),
@@ -254,7 +293,12 @@ async function parseResponse(res: Response): Promise<EmbeddingResponse> {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 export async function embed(text: string): Promise<number[]> {
+  const cfg = getCfg();
+  const key = cacheKey(cfg.model, text);
+  const hit = cacheLookup(key);
+  if (hit) return hit;
   const [v] = await embedBatch([text]);
+  if (v) cacheStore(key, v);
   return v;
 }
 
@@ -263,7 +307,7 @@ export async function embedBatch(
   onProgress?: (i: number, total: number) => void,
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
-  const cfg = resolveEmbedConfig(loadConfig());
+  const cfg = getCfg();
   const { dim: serverDim } = await probe();
 
   // Dim guard: if the user pinned a dim in config, the server must agree.

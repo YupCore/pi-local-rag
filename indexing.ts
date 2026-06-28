@@ -141,38 +141,63 @@ export async function indexFiles(
 
     skipped += readErrorCount;
 
-    // Phase 2: embed in cross-file groups
-    // Each group is one HTTP POST with up to BATCH_SIZE inputs; keep
-    // group size aligned with embed.ts' BATCH_SIZE.
+    // Phase 2: embed in cross-file groups with bounded concurrency.
+    // Each group is one HTTP POST with up to BATCH_SIZE inputs. Multiple groups
+    // fly in parallel — the wall-time win scales with EMBED_CONCURRENCY up to
+    // the server's actual throughput. 3 is a safe ceiling for a single-process
+    // llama.cpp server; raise for hosted endpoints (OpenAI handles 10+ easily).
     const EMBED_GROUP_TARGET = 64;
-    const groupChunks: { fw: FileWork; ci: number }[] = [];
-    let globalChunkIdx = 0;
-    const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
+    const resolvedCfg = resolveEmbedConfig(loadConfig());
+    const EMBED_CONCURRENCY = resolvedCfg.concurrency ?? 3;
 
-    const flushGroup = async () => {
-      if (groupChunks.length === 0) return;
-      const texts = groupChunks.map(g => g.fw.rawChunks[g.ci].content);
-      stderrProgress(`Embedding ${globalChunkIdx - groupChunks.length + 1}…${globalChunkIdx}/${totalChunks} chunks`);
-      const vectors = await embedBatch(texts);
-      for (let vi = 0; vi < groupChunks.length; vi++) {
-        const g = groupChunks[vi];
-        g.fw._vectors ??= new Array(g.fw.rawChunks.length);
-        g.fw._vectors[g.ci] = vectors[vi];
-      }
-      progress?.onEmbed?.(globalChunkIdx, totalChunks);
-      groupChunks.length = 0;
-      // Yield so the TUI can render the progress update before the next batch.
-      await yield_();
-    };
+    interface GroupJob {
+      texts: string[];
+      targets: { fw: FileWork; ci: number }[];
+    }
 
+    // Pre-build all groups so the worker pool knows exactly what to fetch.
+    const allGroups: GroupJob[] = [];
     for (const fw of toIndex) {
       for (let j = 0; j < fw.rawChunks.length; j++) {
-        groupChunks.push({ fw, ci: j });
-        globalChunkIdx++;
-        if (groupChunks.length >= EMBED_GROUP_TARGET) await flushGroup();
+        let group = allGroups[allGroups.length - 1];
+        if (!group || group.texts.length >= EMBED_GROUP_TARGET) {
+          group = { texts: [], targets: [] };
+          allGroups.push(group);
+        }
+        group.texts.push(fw.rawChunks[j].content);
+        group.targets.push({ fw, ci: j });
       }
     }
-    await flushGroup();
+
+    const totalChunks = allGroups.reduce((s, g) => s + g.texts.length, 0);
+
+    // Pool of workers — each grabs the next pending group index, runs embedBatch,
+    // writes its vectors into the matching file's _vectors slot. Workers
+    // interleave naturally via awaits; nextGroup is shared but JS is single-
+    // threaded so its increment is atomic.
+    let completedChunks = 0;
+    let nextGroup = 0;
+    async function worker(): Promise<void> {
+      while (true) {
+        const i = nextGroup++;
+        if (i >= allGroups.length) return;
+        const group = allGroups[i];
+        const vectors = await embedBatch(group.texts);
+        for (let vi = 0; vi < group.targets.length; vi++) {
+          const t = group.targets[vi];
+          t.fw._vectors ??= new Array(t.fw.rawChunks.length);
+          t.fw._vectors[t.ci] = vectors[vi];
+        }
+        completedChunks += group.texts.length;
+        stderrProgress(`Embedding ${completedChunks}/${totalChunks} chunks`);
+        progress?.onEmbed?.(completedChunks, totalChunks);
+        // Yield so the TUI can render the progress update between batches.
+        await yield_();
+      }
+    }
+
+    const poolSize = Math.min(EMBED_CONCURRENCY, allGroups.length);
+    await Promise.all(Array.from({ length: poolSize }, () => worker()));
 
     // Phase 3: insert chunks + vectors into DB
     const insChunk = database.prepare(`
@@ -193,10 +218,12 @@ export async function indexFiles(
     const tx = database.transaction(() => {
       for (const fw of toIndex) {
         const vectors = fw._vectors;
+        // Hash the file path once per file — every chunk id embeds it.
+        const fpHash = sha256(fw.fp);
         for (let j = 0; j < fw.rawChunks.length; j++) {
           const c = fw.rawChunks[j];
           const chunkResult = insChunk.run(
-            `${sha256(fw.fp)}-${c.lineStart}`,
+            `${fpHash}-${c.lineStart}`,
             fw.fp, c.content, c.lineStart, c.lineEnd, c.hash,
             indexedAt,
             Math.ceil(c.content.length / 4),
@@ -214,10 +241,9 @@ export async function indexFiles(
 
     if (!hadCallbacks) process.stderr.write(`\r\x1b[2K`);
     progress?.onSave?.();
-    const embCfg = resolveEmbedConfig(loadConfig());
     const metaTx = database.transaction(() => {
       database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(new Date().toISOString());
-      database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(embCfg.model);
+      database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(resolvedCfg.model);
       database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('vector_dim', ?)").run(String(getVectorDim()));
     });
     metaTx();

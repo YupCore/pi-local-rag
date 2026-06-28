@@ -54,6 +54,7 @@ All settings are optional. Resolution precedence per field: **env var > `config.
 | `embeddingModel` | `PI_RAG_EMBED_MODEL` | `nomic-embed-text` | Must match what's loaded in your server. |
 | `embeddingApiKey` | `PI_RAG_EMBED_API_KEY` | `""` | Required for OpenAI; ignored by Ollama. |
 | `embeddingDimensions` | `PI_RAG_EMBED_DIMENSIONS` | (probed from server) | Only relevant for OpenAI text-embedding-3-* truncation. |
+| `embeddingConcurrency` | `PI_RAG_EMBED_CONCURRENCY` | `3` | Concurrent `/v1/embeddings` requests during indexing. Raise for hosted endpoints (OpenAI handles 10+); lower for CPU-bound local servers. |
 
 Example `~/.pi/rag/config.json`:
 
@@ -212,6 +213,7 @@ Auto-injection is on by default. Config lives in `<ragDir>/config.json`:
 | `embeddingModel` | env/`nomic-embed-text` | Model id passed as `model` in the request body |
 | `embeddingApiKey` | env/`""` | Sent as `Authorization: Bearer …` |
 | `embeddingDimensions` | env/(probed) | Optional dim hint for OpenAI text-embedding-3-* truncation |
+| `embeddingConcurrency` | env/`3` | Concurrent `/v1/embeddings` requests during indexing (raise for hosted endpoints, lower for CPU-bound local servers) |
 
 ## Testing
 
